@@ -62,7 +62,7 @@ test("encryption.key symlinked to a DIRECTORY is rejected before dereference, no
   assert.match(stderr, /符号链接/);
 });
 
-test("normal sandbox dir writes regular 0600 files", () => {
+test("normal sandbox dir writes regular 0600 files", { skip: process.platform === "win32" && "Windows 无 POSIX 0600 权限位（Node 报 0o666；权限写入 no-op，同 fs_ext Windows imp）" }, () => {
   const t = mktmp();
   const auth = path.join(t, ".sandbox", "auth");
   fs.mkdirSync(auth, { recursive: true });

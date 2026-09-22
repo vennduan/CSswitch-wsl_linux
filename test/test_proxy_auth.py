@@ -89,7 +89,8 @@ class ProxyAuth(unittest.TestCase):
                      {"model": "claude-opus-4-8", "max_tokens": 10,
                       "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(s, 200)
-        with open(self.logf) as f:
+        # 日志文件固定 UTF-8（中文 Windows 默认 GBK，读中文日志会解码失败）
+        with open(self.logf, encoding="utf-8") as f:
             self.assertNotIn(SEC, f.read())
 
     def test_unauth_post_closes_connection_no_leak_on_reuse(self):

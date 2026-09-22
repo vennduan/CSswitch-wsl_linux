@@ -27,7 +27,15 @@ echo "CSSwitch doctor（只读诊断，不启动进程、不联网、绝不碰�
 echo "生效来源=${PROVIDER:-（无）}  适配器=${ADAPTER:-（无）}  代理端口=$PROXY_PORT  沙箱端口=$SANDBOX_PORT"
 
 echo "[依赖]"
-if command -v python3 >/dev/null 2>&1; then pass "python3 $(python3 --version 2>&1 | awk '{print $2}')"; else fail "缺 python3（起翻译代理需要）"; fi
+# Windows 下 python3 常是 WindowsApps 商店 stub（命令存在但报错退出、无输出），
+# 与 app 侧查找策略一致：python3 不能真跑时回退 python。
+if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
+  pass "python3 $(python3 --version 2>&1 | awk '{print $2}')"
+elif command -v python >/dev/null 2>&1 && python --version >/dev/null 2>&1; then
+  pass "python $(python --version 2>&1 | awk '{print $2}')（python3 为商店 stub/缺失，app 会自动回退 python）"
+else
+  fail "缺 python3（起翻译代理需要）"
+fi
 # node 自 v0.1.4 起【非】app 必需：虚拟登录已由 app 进程内 Rust 原生伪造（去 node）。
 # node 只有独立跑 scripts/make-virtual-oauth.mjs（dev/对拍）时才需要，故缺失只提示不算失败。
 if command -v node >/dev/null 2>&1; then pass "node $(node --version 2>&1)（app 已不需要，仅 dev 脚本用）"; else warn "无 node（app 无需；仅独立跑 make-virtual-oauth.mjs 时才需要）"; fi

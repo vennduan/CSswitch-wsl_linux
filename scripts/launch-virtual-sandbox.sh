@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # 启动一个【隔离 + 虚拟登录】的 Claude Science 沙箱：
 #   用本地自造的虚拟 OAuth 让 Science 认为已登录（virtual@localhost.invalid），
 #   推理经 ANTHROPIC_BASE_URL 导去本项目翻译代理 → 通义千问。
@@ -17,7 +17,7 @@
 #   再起沙箱: scripts/launch-virtual-sandbox.sh [--port 8990] [--proxy-url http://127.0.0.1:18991]
 set -euo pipefail
 
-PROJ="${0:A:h:h}"
+PROJ="$(cd "$(dirname "$0")/.." && pwd)"
 SANDBOX_HOME="${SANDBOX_HOME:-$PROJ/.sandbox/home}"
 DATA_DIR="$SANDBOX_HOME/.claude-science"   # = auth_dir（Science 按 HOME 推导）
 REAL_DIR="$HOME/.claude-science"
@@ -42,7 +42,19 @@ done
 # —— 铁律断言：绝不使用真实目录 / 真实端口 ——
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "拒绝：端口不是合法整数（$PORT）"; exit 1; }
 if (( 10#${PORT} == 8765 )); then echo "拒绝：端口 8765 是真实实例保留端口"; exit 1; fi
-_dd_real="${DATA_DIR:A}"; _real_real="${REAL_DIR:A}"
+# bash 版 zsh :A：解析符号链接（含悬空符号链接）与已存在的父目录前缀
+_resolved() {
+  local d b p t
+  d="$(dirname "$1")"; b="$(basename "$1")"
+  if [ -d "$d" ]; then d="$(cd "$d" 2>/dev/null && pwd -P || printf '%s' "$d")"; fi
+  p="$d/$b"
+  while [ -L "$p" ]; do
+    t="$(readlink "$p")"
+    case "$t" in /*) p="$t";; *) p="$(dirname "$p")/$t";; esac
+  done
+  if [ -d "$p" ]; then (cd "$p" 2>/dev/null && pwd -P) || printf '%s' "$p"; else printf '%s' "$p"; fi
+}
+_dd_real="$(_resolved "$DATA_DIR")"; _real_real="$(_resolved "$REAL_DIR")"
 if [[ "$_dd_real" == "$_real_real" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
 if [[ "$DRY_RUN" == "1" ]]; then echo "DRY-RUN OK：护栏通过，未启动沙箱。"; exit 0; fi
 if [[ ! -x "$BIN" ]]; then echo "找不到 Science 二进制: $BIN"; exit 1; fi

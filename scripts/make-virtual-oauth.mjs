@@ -80,7 +80,7 @@ if (resolvedAuth === realDir) {
   console.error(`拒绝：--auth-dir 指向真实凭证目录 ${realDir}。铁律禁止。`);
   process.exit(3);
 }
-if (!/\.sandbox\//.test(resolvedAuth) && !force) {
+if (!/\.sandbox[\\/]/.test(resolvedAuth) && !force) {
   console.error(`拒绝：--auth-dir (${resolvedAuth}) 不在 .sandbox/ 下。若确属沙箱可加 --force。`);
   process.exit(3);
 }

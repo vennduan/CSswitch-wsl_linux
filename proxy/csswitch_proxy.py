@@ -160,7 +160,8 @@ def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line, flush=True)
     if LOG:
-        with open(LOG, "a") as f:
+        # 固定 UTF-8：中文 Windows 默认 GBK，日志含中文时跨平台读取会解码失败
+        with open(LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
 

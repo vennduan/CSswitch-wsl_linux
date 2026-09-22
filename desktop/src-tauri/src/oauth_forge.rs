@@ -21,8 +21,10 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-// 跨平台文件权限抽象（仅 macOS 编译此模块，但保持导入一致）。
-use crate::fs_ext::{set_file_permissions, OpenOptionsExt, PermissionsExt};
+// 跨平台文件权限抽象（macOS / Windows 均编译此模块）。
+use crate::fs_ext::{set_file_permissions, OpenOptionsExt};
+#[cfg(unix)]
+use crate::fs_ext::PermissionsExt;
 // 替代 /dev/urandom 的跨平台随机数生成。
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -599,15 +601,29 @@ fn read_intact_login(resolved: &Path, email: &str) -> Option<ForgeResult> {
     })
 }
 
+/// 解析用户主目录：HOME → USERPROFILE。Windows GUI 进程常没有 HOME 只有 USERPROFILE，
+/// 这里兜底以免跨平台时误判「无 HOME」。找不到返回 Err（护栏失败关闭）。
+fn user_home() -> Result<PathBuf, String> {
+    if let Some(h) = std::env::var_os("HOME") {
+        if !h.is_empty() {
+            return Ok(PathBuf::from(h));
+        }
+    }
+    if let Some(h) = std::env::var_os("USERPROFILE") {
+        if !h.is_empty() {
+            return Ok(PathBuf::from(h));
+        }
+    }
+    Err("无 HOME / USERPROFILE 环境变量".to_string())
+}
+
 /// 幂等虚拟登录：完整自洽→复用；部分损坏→修复但保 org；真首次→铸新。
 pub fn ensure_virtual_login(
     auth_dir: &Path,
     email: &str,
     sandbox_root: &Path,
 ) -> Result<(ForgeResult, LoginAction), String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("无 HOME 环境变量")?;
+    let home = user_home()?;
     ensure_virtual_login_guarded(auth_dir, email, sandbox_root, &home.join(".claude-science"))
 }
 
@@ -656,9 +672,9 @@ fn ensure_virtual_login_guarded(
 /// 失效（旧版遗留 / 凭证损坏 / 已落登录页），重开也只会再落登录页，应改走「停沙箱 → 修复保
 /// org → 重启」。这样 0.2.0 的健康快捷路径不再把「健康但登录失效」当成可用（修 0.2.1 Bug2）。
 pub fn login_intact(auth_dir: &Path, email: &str, sandbox_root: &Path) -> bool {
-    match std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude-science")) {
-        Some(real) => login_intact_guarded(auth_dir, email, sandbox_root, &real),
-        None => false,
+    match user_home() {
+        Ok(home) => login_intact_guarded(auth_dir, email, sandbox_root, &home.join(".claude-science")),
+        Err(_) => false,
     }
 }
 

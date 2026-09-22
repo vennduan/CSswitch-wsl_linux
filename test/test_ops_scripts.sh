@@ -12,6 +12,10 @@ VERIFY="$ROOT/scripts/verify-proxy.sh"
 SELFTEST="$ROOT/scripts/self-test.sh"
 PROXY="$ROOT/proxy/csswitch_proxy.py"
 T="$(mktemp -d)"
+# Windows 下 python3 常是 WindowsApps 商店 stub（命令存在但报错退出、无输出），
+# 与 app 侧 lib_tauri.rs 的 python 查找策略一致：选一个能真跑的解释器。
+PY=python3
+if ! python3 --version >/dev/null 2>&1; then PY=python; fi
 
 # ---------- doctor ----------
 # 正常：依赖齐全（本机有 python3/node），config 指向不存在的临时路径 → 退出 0
@@ -22,28 +26,31 @@ if [ $rc -eq 0 ]; then ok "doctor exits 0 when deps present"; else no "doctor fa
 out="$(CSSWITCH_PROXY_PORT=8765 CSSWITCH_CONFIG="$T/nope.json" "$DOCTOR" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "8765"; then ok "doctor fails on reserved port 8765"; else no "doctor did not reject 8765 (rc=$rc): $out"; fi
 
-# key 脱敏：设了 key，输出报「已设置」但绝不含 key 明文
+# key 脱敏：key 有无走 CSSWITCH_KEY_PRESENT（多 profile 后 doctor 不再读 shell 环境变量），
+# 输出报「已配置」但绝不含 key 明文；env 里同时放一个假 key 验证它绝不被回显。
 SECRETVAL="DUMMY-KEY-abc123XYZ-should-never-print"
-out="$(DEEPSEEK_API_KEY="$SECRETVAL" CSSWITCH_PROVIDER=deepseek CSSWITCH_CONFIG="$T/nope.json" "$DOCTOR" 2>&1)"; rc=$?
+out="$(DEEPSEEK_API_KEY="$SECRETVAL" CSSWITCH_KEY_PRESENT=1 CSSWITCH_PROVIDER=deepseek CSSWITCH_CONFIG="$T/nope.json" "$DOCTOR" 2>&1)"; rc=$?
 if echo "$out" | grep -q "$SECRETVAL"; then no "doctor LEAKED key value"; else ok "doctor never prints key value"; fi
-if echo "$out" | grep -q "已设置"; then ok "doctor reports key present"; else no "doctor did not report key present: $out"; fi
+if echo "$out" | grep -q "已配置"; then ok "doctor reports key present"; else no "doctor did not report key present: $out"; fi
 
 # config 权限：0644 → 警告应为 600（不改变退出码，仍 0）
 CFG644="$T/cfg644.json"; echo '{}' > "$CFG644"; chmod 644 "$CFG644"
 out="$(CSSWITCH_CONFIG="$CFG644" "$DOCTOR" 2>&1)"; rc=$?
 if echo "$out" | grep -q "600"; then ok "doctor warns on non-600 config perms"; else no "doctor missed bad config perms: $out"; fi
 
-# config 是符号链接 → 拒绝（失败关闭）
-CFGLINK="$T/cfglink.json"; ln -s "$CFG644" "$CFGLINK"
+# config 是符号链接 → 拒绝（失败关闭）。Windows msys 的 ln -s 默认是复制不是符号链接，
+# 用 node 建真符号链接（run_all 本就要求 node；ln -s 兜底覆盖无 node 的环境）。
+CFGLINK="$T/cfglink.json"
+node -e "require('fs').symlinkSync(process.argv[1], process.argv[2])" "$CFG644" "$CFGLINK" 2>/dev/null || ln -s "$CFG644" "$CFGLINK"
 out="$(CSSWITCH_CONFIG="$CFGLINK" "$DOCTOR" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "doctor rejects symlinked config"; else no "doctor accepted symlinked config (rc=$rc): $out"; fi
 
 # ---------- verify-proxy ----------
 # 找一个空闲端口，起一个真代理（假 key，上游 URL 是假的但不会被 /health、/v1/models 触及）
-P="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+P="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 SEC="verify-test-secret"
 DEEPSEEK_API_KEY=fake CSSWITCH_UPSTREAM_URL="http://127.0.0.1:1/never" \
-  python3 "$PROXY" --provider deepseek --port "$P" --auth-token "$SEC" \
+  "$PY" "$PROXY" --provider deepseek --port "$P" --auth-token "$SEC" \
   >/dev/null 2>&1 &
 PROXY_PID=$!
 # 等健康

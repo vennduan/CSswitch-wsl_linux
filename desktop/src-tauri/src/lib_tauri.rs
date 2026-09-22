@@ -13,6 +13,63 @@ use tauri::{Manager, State};
 #[cfg(target_os = "macos")]
 const SCIENCE_BIN: &str = "/Applications/Claude Science.app/Contents/Resources/bin/claude-science";
 
+/// 平台分派：定位 Claude Science CLI。
+/// macOS：/Applications 路径；Windows：官方安装目录 / PATH；其他平台（helper 构建）None。
+fn science_bin_any() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let p = PathBuf::from(SCIENCE_BIN);
+        return if p.is_file() { Some(p) } else { None };
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return science_bin_windows();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        return None;
+    }
+}
+
+/// Windows 上定位 Claude Science CLI（官方安装器 v0.1.x 默认布局）：
+/// 1) `%LOCALAPPDATA%\Programs\ClaudeScience\claude-science.com`（console shim，同步转发）
+/// 2) 同目录 `claude-science.exe`（真实二进制）
+/// 3) PATH 里的 `claude-science`（用户自装到别处）
+#[cfg(target_os = "windows")]
+fn science_bin_windows() -> Option<PathBuf> {
+    let names = ["claude-science.com", "claude-science.exe"];
+    if let Some(lad) = std::env::var_os("LOCALAPPDATA") {
+        let dir = PathBuf::from(lad).join("Programs").join("ClaudeScience");
+        for n in names {
+            let p = dir.join(n);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for n in names {
+                let p = dir.join(n);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 给 Science CLI 子进程设置独立 HOME（铁律 3：与真实目录隔开）。
+/// Windows **绝不覆盖 USERPROFILE**：Science 自带的 winsbx 护栏经 SHGetKnownFolderPath
+/// 解析 local AppData 根来构建 protected-root 表，该解析受 env USERPROFILE 影响——
+/// 覆盖成沙箱路径后解析结果不存在（win32 error 3），护栏拒绝 arming，serve 以 rc=4 退出；
+/// 且伪造假 AppData 根会让护栏的 protected-root 表指向假目录，削弱其对真实 AppData 的保护。
+/// 真机冒烟已验证：HOME-only 覆盖 + --data-dir 即可完整 arming，真实目录零改动。
+fn science_cli_env(cmd: &mut Command, home: &Path) {
+    cmd.env("HOME", home);
+}
+
 #[derive(Default)]
 struct AppState {
     proxy: Option<Child>,
@@ -161,10 +218,10 @@ fn asset_root(app: &tauri::AppHandle) -> Option<PathBuf> {
 }
 
 /// 沙箱可写工作目录（独立 HOME）：`~/.csswitch/sandbox/home`。
-/// 仅 macOS 本地模式有效（依赖 SCIENCE_BIN 和沙箱脚本）。
+/// 本地模式（macOS / Windows）使用；远程模式不落本地沙箱状态。
 /// 打包后资源目录只读，沙箱状态（虚拟登录、克隆运行时、钥匙串）必须落在可写处；
-/// 该路径同时交给 launch/stop 脚本（`SANDBOX_HOME` 环境变量）与取 URL 逻辑，三者一致。
-#[cfg(target_os = "macos")]
+/// macOS 交给 launch/stop 脚本（`SANDBOX_HOME` 环境变量）；Windows 直接作 CLI 的
+/// HOME/USERPROFILE。纯路径构造，所有平台编译（Linux 上只是不被本地模式调用）。
 fn sandbox_home() -> PathBuf {
     config::default_dir().join("sandbox").join("home")
 }
@@ -262,11 +319,9 @@ fn open_in_browser(url: &str) -> Result<(), String> {
 }
 
 // ---------- 代理生命周期核心 ----------
-/// 转义 ERE（extended regex）元字符，让路径按字面参与 `pkill -f` 匹配（避免路径里的
+/// 转义 ERE（extended regex）元字符，让路径按字面参与进程匹配（避免路径里的
 /// `.`/`(`/`[` 等被当作正则、误配或失配）。
-/// 仅在 Unix 平台的 ensure_proxy 中被调用（pkill 为 Unix 专有）。
-/// 非 Unix 平台未使用，保留以备将来跨平台进程管理需求。
-#[allow(dead_code)]
+/// Unix：`pkill -f`（ensure_proxy）；Windows：PowerShell `-match`（.NET 正则，转义兼容）。
 fn ere_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
@@ -285,6 +340,49 @@ enum ProxyAction {
     Restarted, // 首次起 / 换 key / 换 provider / 不健康，重起了代理
 }
 
+/// 定位可起翻译代理的 Python 解释器。
+/// Windows：`python3` 常是 WindowsApps 商店 stub（假命中：执行弹商店且无输出），且
+/// `fs::metadata` 不做 PATHEXT 解析（必须带 .exe 后缀才找得到），故候选带 .exe 变体并对每个
+/// 命中做 `--version` 验证，再退回 `python`。Unix 走 [`proc::find_exe`]（PATH+常见目录+登录 shell）。
+fn find_python() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        for name in ["python3.exe", "python.exe", "python3", "python"] {
+            if let Some(p) = proc::find_exe(name) {
+                if python_works(&p) {
+                    return Some(p);
+                }
+            }
+        }
+        return None;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        proc::find_exe("python3")
+    }
+}
+
+/// 验证 Python 可执行（Windows 上 WindowsApps stub 会返回假命中）：`--version` 输出
+/// （stdout；stub 无输出则看 stderr）含 "Python" 才算可用（真实解释器形如 "Python 3.12.4"）。
+#[cfg(target_os = "windows")]
+fn python_works(p: &Path) -> bool {
+    let out = match Command::new(p)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = if s.trim().is_empty() {
+        String::from_utf8_lossy(&out.stderr)
+    } else {
+        s
+    };
+    s.contains("Python")
+}
+
 /// 确保代理在跑且健康；返回 (端口, secret, 本次动作)。幂等：已健康则复用。
 fn ensure_proxy(
     app: &tauri::AppHandle,
@@ -300,8 +398,6 @@ fn ensure_proxy(
     let port = cfg.proxy_port;
     let root = asset_root(app)
         .ok_or("找不到代理脚本 proxy/csswitch_proxy.py（打包资源或仓库根均未命中）。开发态可设 CSSWITCH_REPO。")?;
-    let py = proc::find_exe("python3")
-        .ok_or("缺少依赖 python3（起翻译代理需要）。已查 PATH、常见目录与登录 shell 仍未找到；macOS 一般自带 /usr/bin/python3（装 Xcode 命令行工具：xcode-select --install）。")?;
 
     // path-secret：**持久化复用**。已在跑的沙箱把该 secret 嵌进了 ANTHROPIC_BASE_URL，
     // 若每次起代理都换 secret，代理一重启（换 key/换 provider/重开 app）沙箱就会拿旧 secret
@@ -337,14 +433,35 @@ fn ensure_proxy(
         // 孤儿仍占着端口 → 新代理绑不上（Errno 48）→ 探活超时。
         // 收紧（P2 GPT 复审）：匹配【本安装的绝对脚本路径】+ 端口，而非仅「脚本名+端口」，
         // 避免误杀另一个 checkout / 用户手启的同名代理。路径里的正则元字符转义按字面匹配。
-        // 跨平台：`pkill` 仅 Unix 可用；Windows 上孤儿进程由系统自动回收，且远程模式为主要场景。
+        // 跨平台：Unix 用 `pkill -f`；Windows 无 pkill，用 PowerShell Win32_Process 按命令行
+        // 匹配（.NET 正则与 ere_escape 输出兼容），匹配串经环境变量传入不进 PowerShell argv。
         #[cfg(unix)]
         {
             let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
             let _ = Command::new("pkill").arg("-f").arg(&pat).status();
         }
+        #[cfg(target_os = "windows")]
+        {
+            let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
+            let _ = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$p = $env:CSSWITCH_KILL_PAT; Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='python3.exe'\" | Where-Object { $_.CommandLine -and $_.CommandLine -match $p } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+                ])
+                .env("CSSWITCH_KILL_PAT", &pat)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
 
-        let logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
+        // Python 解释器：懒定位（复用路径不付 PATH 扫描 + --version 验证的成本）。
+        let py = find_python().ok_or(
+            "缺少可用的 Python 解释器（起翻译代理需要）。已查 PATH（macOS 另查常见目录与登录 shell），Windows 上 python3/python 的 --version 均未验证通过。请安装 Python 3（python.org 或商店真实版）并确保其在 PATH 中。",
+        )?;
+
+        let mut logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(&py);
         cmd.arg(&script)
@@ -400,20 +517,57 @@ fn ensure_proxy(
     Ok((port, secret, ProxyAction::Restarted))
 }
 
-/// 停沙箱。返回 Err 表示 stop 脚本非零退出（Science 可能没停干净），
+/// 停沙箱。返回 Err 表示停止动作非零退出（Science 可能没停干净），
 /// 调用方据此如实报告，不再无条件报「已停止」（修 P1 停止虚假成功）。
-/// 仅 macOS 有效；非 macOS 上本地沙箱不存在，直接清 state 返回 Ok。
+/// macOS：调 stop 脚本；Windows：调 Science CLI `stop --data-dir`（按 data-dir 停，绝不碰
+/// 真实实例）；其他平台本地沙箱不存在，直接清 state 返回 Ok。
 fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
     // 沙箱由脚本以 --detached 起 Science，本进程持有的是脚本 child（已退出）。
     // 真正停 Science 要调 stop 脚本（按 data-dir，绝不碰真实 8765）。
     // 修 P1（GPT 复审）：定位不到资源根 / 停止脚本时，绝不静默返回成功——detached 沙箱
     // 可能仍在跑，谎报「已停止」会让「切官方模式」误以为第三方链路已拆。此时如实报错。
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = app;
         kill_child(&mut st.sandbox);
         st.sandbox_url = None;
         return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = app;
+        let mut err = None;
+        // Windows：Science CLI 自带 `stop --data-dir`（lockfile 定位，只停该 data-dir 的
+        // daemon，绝不影响真实实例）。先优雅 stop；CLI 定位不到时如实报错。
+        match science_bin_windows() {
+            Some(bin) => {
+                let home = sandbox_home();
+                let mut cmd = Command::new(&bin);
+                cmd.arg("stop")
+                    .arg("--data-dir")
+                    .arg(home.join(".claude-science"));
+                science_cli_env(&mut cmd, &home);
+                match cmd.stdout(Stdio::null()).stderr(Stdio::null()).status() {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => err = Some(format!("停止沙箱命令非零退出（{:?}）。", s.code())),
+                    Err(e) => err = Some(format!("调用停止沙箱命令失败：{e}")),
+                }
+            }
+            None => {
+                err = Some(
+                    "找不到 Claude Science CLI，无法确认沙箱已停止（沙箱可能仍在运行）。"
+                        .to_string(),
+                );
+            }
+        }
+        // 兜底：若 --detached 未生效、本进程持有的就是 daemon 本体，kill 之（stale lockfile
+        // 由下次 `stop` 的「no daemon running」语义兜住）。
+        kill_child(&mut st.sandbox);
+        st.sandbox_url = None;
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -422,7 +576,7 @@ fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
         Some(root) => {
             let stop = root.join("scripts/stop-science-sandbox.sh");
             if stop.is_file() {
-                match Command::new("zsh") // stop 脚本是 #!/bin/zsh（用了 ${VAR:A} realpath）
+                match Command::new("bash") // stop 脚本 #!/usr/bin/env bash（跨 macOS/Git Bash 可执行）
                     .arg(&stop)
                     // 与 launch 时一致的可写沙箱 HOME，stop 才能按同一 data-dir 停对进程。
                     .env("SANDBOX_HOME", sandbox_home())
@@ -565,17 +719,63 @@ fn set_mode(
 }
 
 /// 官方模式：干净地打开用户【真实】的 Claude Science（用户自己的官方登录与订阅）。
-/// 仅 macOS 有效（需本地安装 Claude Science.app）；在 Windows / 其他平台上返回明确提示，
-/// 引导用户使用远程模式管理服务器上的 Science。
+/// macOS：`open` Claude Science.app；Windows：经 Start Menu 快捷方式（`cmd /c start`）正常
+/// 启动；其他平台返回明确提示，引导用户使用远程模式管理服务器上的 Science。
 ///
-/// 铁律：绝不碰/复制真实凭证；用 `open`（系统 LaunchServices 正常启动）而非注入环境变量，
+/// 铁律：绝不碰/复制真实凭证；正常启动而非注入环境变量，
 /// 并显式抹掉任何 `ANTHROPIC_*`，确保**不用改过的环境变量启动真实实例**（真实实例走它自己的
 /// 官方端点，不经本代理）。CSSwitch 只把用户交回官方客户端，不托管其登录。
 #[tauri::command]
 fn open_official() -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        return Err("本地模式「打开官方 Claude Science」仅支持 macOS。请使用远程模式连接到运行 Science 的 Linux 服务器。".into());
+        return Err("本地模式「打开官方 Claude Science」仅支持 macOS / Windows。请使用远程模式连接到运行 Science 的 Linux 服务器。".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Start Menu 快捷方式（per-user / all-users 各查一次）。不直接 spawn
+        // claude-science.exe：无子命令时行为未知（可能是交互式 REPL，会挂住调用方）。
+        let mut cands: Vec<PathBuf> = Vec::new();
+        if let Some(ad) = std::env::var_os("APPDATA") {
+            cands.push(
+                PathBuf::from(ad)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Start Menu")
+                    .join("Programs")
+                    .join("Claude Science.lnk"),
+            );
+        }
+        if let Some(pd) = std::env::var_os("ProgramData") {
+            cands.push(
+                PathBuf::from(pd)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Start Menu")
+                    .join("Programs")
+                    .join("Claude Science.lnk"),
+            );
+        }
+        let lnk = cands.into_iter().find(|p| p.is_file()).ok_or(
+            "找不到 Claude Science 的开始菜单快捷方式（%APPDATA% / %ProgramData% 下的 Start Menu\\Programs\\Claude Science.lnk）。请确认已安装官方 Claude Science Windows 版。",
+        )?;
+        // `start` 后跟空标题，路径含空格可整体带引号。防御性：显式抹掉任何 ANTHROPIC_*，
+        // 杜绝把改过的环境变量带进真实实例（铁律 3）。
+        let st = Command::new("cmd")
+            .args(["/c", "start", ""])
+            .arg(&lnk)
+            .env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .status()
+            .map_err(|e| format!("打开官方 Claude Science 失败：{e}"))?;
+        if st.success() {
+            return Ok(());
+        }
+        Err(format!(
+            "start 非零退出（{:?}）：未能打开官方 Claude Science。",
+            st.code()
+        ))
     }
     #[cfg(target_os = "macos")]
     {
@@ -609,6 +809,12 @@ struct UiSettings {
 fn set_config(cfg: UiSettings) -> Result<(), String> {
     if cfg.proxy_port == 8765 || cfg.sandbox_port == 8765 {
         return Err("端口 8765 是真实 Science 实例保留端口，不能用。".into());
+    }
+    // Windows 版真实 Science 默认端口是 8000（serve 不带 --port 时）：沙箱/代理都不能占它，
+    // 否则用户真实实例起不来（铁律 3）。
+    #[cfg(target_os = "windows")]
+    if cfg.proxy_port == 8000 || cfg.sandbox_port == 8000 {
+        return Err("端口 8000 是 Windows 版真实 Science 默认端口，不能用。".into());
     }
     if cfg.proxy_port == 0 || cfg.sandbox_port == 0 {
         return Err("端口不能为 0。".into());
@@ -991,16 +1197,17 @@ fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<
 }
 
 /// 「一键开始」：起代理 → 写虚拟 OAuth → 起沙箱 Science → 探活 → 开浏览器。
-/// 仅 macOS 本地模式有效。Windows/其他平台应使用远程模式 (`remote_*` 命令)。
+/// macOS：经 launch/stop 脚本；Windows：原生 `claude-science serve --detached`（独立
+/// data-dir + HOME/USERPROFILE，铁律 3）。其他平台应使用远程模式 (`remote_*` 命令)。
 #[tauri::command]
 fn one_click_login(
     app: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (&app, &state);
-        return Err("本地模式「一键开始」仅支持 macOS。请切换到「远程服务器」模式管理 Linux 服务器上的 Science。".into());
+        return Err("本地模式「一键开始」仅支持 macOS / Windows。请切换到「远程服务器」模式管理 Linux 服务器上的 Science。".into());
     }
     #[cfg(target_os = "macos")]
     {
@@ -1067,7 +1274,7 @@ fn one_click_login(
 
     // 4. 起沙箱：脚本以 --detached 起 Science，然后返回。
     let proxy_url = format!("http://127.0.0.1:{pport}/{secret}");
-    let logf = open_log("sandbox.log").map_err(|e| format!("建日志失败：{e}"))?;
+    let mut logf = open_log("sandbox.log").map_err(|e| format!("建日志失败：{e}"))?;
     // 虚拟登录摘要面包屑（无密钥；uuid/假账号/沙箱路径均不敏感），便于用户附日志排查。
     {
         use std::io::Write;
@@ -1083,7 +1290,7 @@ fn one_click_login(
         );
     }
     let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-    let status = Command::new("zsh") // launch 脚本是 #!/bin/zsh（用了 ${VAR:A} realpath）
+    let status = Command::new("bash") // launch 脚本 #!/usr/bin/env bash（跨 macOS/Git Bash 可执行）
         .arg(&launch)
         .arg("--port")
         .arg(sport.to_string())
@@ -1154,15 +1361,162 @@ fn one_click_login(
     };
     Ok(json!({ "url": url, "msg": msg, "action": "started" }))
     } // #[cfg(target_os = "macos")]
+
+    #[cfg(target_os = "windows")]
+    {
+    // 1~3. 确保代理在跑且健康（内部已查 key、探活）。带回本次是复用还是重启。
+    let (pport, secret, proxy_action) = ensure_proxy(&app, &state)?;
+
+    let dir = config::default_dir();
+    let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+    let sport = cfg.sandbox_port;
+
+    // sandbox_home() 作沙箱根 + 独立 HOME/USERPROFILE（铁律 3：与真实用户目录完全隔开）。
+    let sbx_home = sandbox_home();
+    let auth_dir = sbx_home.join(".claude-science");
+
+    // 沙箱已健康 → daemon 活着 ≠ 登录态可用：先只读校验虚拟登录是否自洽（修 0.2.1 Bug2）。
+    // - 自洽 → 绝不重伪造、绝不重起（连 auth 文件都不读，operon 可能正在用），只重取 URL +
+    //   打开。活动 org 不变，旧对话一直在。
+    // - 健康但登录失效 → 重开也只会再落登录页，故停沙箱、落到下面「修复保 org + 重启」路径。
+    if sandbox_running_ours(sport) {
+        if oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home) {
+            let url = sandbox_url(sport);
+            {
+                let mut st = lock(&state);
+                st.sandbox_port = sport;
+                st.sandbox_url = Some(url.clone());
+            }
+            let base = match proxy_action {
+                ProxyAction::Reused => "已在运行",
+                ProxyAction::Restarted => "已用新配置重启代理，Science 沿用不变",
+            };
+            // P2c：捕获打开结果——失败不谎报「已重新打开」，改提示手动打开。
+            let msg = match open_in_browser(&url) {
+                Ok(()) => format!("{base}，已重新打开 Science。"),
+                Err(_) => format!("{base}，服务已就绪，请手动打开：{url}"),
+            };
+            return Ok(json!({ "url": url, "msg": msg, "action": "reopened" }));
+        }
+        {
+            let mut st = lock(&state);
+            let _ = stop_sandbox_inner(&app, &mut st);
+        }
+    }
+
+    // 定位 Claude Science CLI（Windows 本地模式必需；官方安装目录 / PATH）。
+    let bin = science_bin_windows().ok_or(
+        "找不到 Claude Science（本地模式需要）。已查 %LOCALAPPDATA%\\Programs\\ClaudeScience 与 PATH 仍未命中；请确认已安装官方 Claude Science Windows 版。",
+    )?;
+
+    // 进程内确保虚拟 OAuth（Rust 原生密码学，零 node）。幂等：现有登录完整就复用、部分坏就
+    // 修复但保住 org、真首次才铸新；绝不触碰真实凭证树（铁律 1/2）。
+    let (forged, login_action) =
+        oauth_forge::ensure_virtual_login(&auth_dir, "virtual@localhost.invalid", &sbx_home)
+            .map_err(|e| format!("写虚拟登录失败：{e}"))?;
+
+    // 4. 起沙箱：`serve --detached`。独立 data-dir + 独立 HOME/USERPROFILE（铁律 3）。
+    // 推理经 ANTHROPIC_BASE_URL 导去本地代理（推理不走 Anthropic）；回环地址不走路由代理
+    // （用户 shell 里的小写 https_proxy 指向 127.0.0.1:7890，不能让它劫持对代理的直连）。
+    let proxy_url = format!("http://127.0.0.1:{pport}/{secret}");
+    let mut logf = open_log("sandbox.log").map_err(|e| format!("建日志失败：{e}"))?;
+    // 虚拟登录摘要面包屑（无密钥；uuid/假账号/沙箱路径均不敏感），便于用户附日志排查。
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            logf,
+            "[oauth] 虚拟登录已就绪（Rust，零 node；action={:?}）：auth_dir={} account={} org={} enc={}",
+            login_action,
+            forged.auth_dir.display(),
+            forged.account_uuid,
+            forged.org_uuid,
+            forged.enc_file.display()
+        );
+    }
+    let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve")
+        .arg("--data-dir")
+        .arg(&auth_dir)
+        .arg("--port")
+        .arg(sport.to_string())
+        .arg("--no-browser")
+        .arg("--no-auto-update")
+        .arg("--detached")
+        .env("ANTHROPIC_BASE_URL", &proxy_url)
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env("NO_PROXY", "127.0.0.1,localhost");
+    science_cli_env(&mut cmd, &sbx_home);
+    let child = cmd
+        .stdout(Stdio::from(logf))
+        .stderr(Stdio::from(logf2))
+        .spawn()
+        .map_err(|e| format!("起沙箱失败：{e}"))?;
+    {
+        let mut st = lock(&state);
+        st.sandbox = Some(child);
+        st.sandbox_port = sport;
+    }
+
+    // 5. 轮询沙箱 /health 直到就绪或超时（Windows daemon 启动较慢，~20s）。
+    let mut ok = false;
+    for _ in 0..200 {
+        std::thread::sleep(Duration::from_millis(100));
+        if proc::http_health(sport, None, 400) {
+            ok = true;
+            break;
+        }
+    }
+    if !ok {
+        let tail = redact(&tail_file(&log_path("sandbox.log"), 600), &secret);
+        // 探活超时：必须停掉刚起的沙箱，否则留孤儿沙箱进程（修 P2-2）。
+        {
+            let mut st = lock(&state);
+            let _ = stop_sandbox_inner(&app, &mut st); // best-effort 清理
+        }
+        return Err(format!(
+            "沙箱起后探活超时（端口 {sport}）。已尝试停掉刚起的沙箱。\n{tail}"
+        ));
+    }
+
+    // 5b. 身份确认（修 P2 GPT 复审）：/health 200 只证明端口在服务，不证明是我们的 Science。
+    // 按 data-dir 强身份再确认一次；不是我们的 → 当启动失败处理，停掉并如实报错。
+    if !sandbox_running_ours(sport) {
+        {
+            let mut st = lock(&state);
+            let _ = stop_sandbox_inner(&app, &mut st);
+        }
+        return Err(format!(
+            "端口 {sport} 有服务响应，但按 data-dir 确认不是本沙箱 Science（疑似被其它服务占用）。已尝试停掉刚起的沙箱。"
+        ));
+    }
+
+    // 6. 取 UI URL（登录态），交系统浏览器打开。
+    let url = sandbox_url(sport);
+    {
+        let mut st = lock(&state);
+        st.sandbox_port = sport;
+        st.sandbox_url = Some(url.clone());
+    }
+    let started = match login_action {
+        oauth_forge::LoginAction::Created => "已启动",
+        _ => "沙箱已重新启动，沿用原有对话", // Reused / Repaired
+    };
+    let msg = match open_in_browser(&url) {
+        Ok(()) => format!("{started}。"),
+        Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
+    };
+    Ok(json!({ "url": url, "msg": msg, "action": "started" }))
+    } // #[cfg(target_os = "windows")]
 }
 
 /// 从 `claude-science url` 的 stdout 里取**第一条**合法 http(s) URL。
-/// 仅 macOS 本地模式需要（依赖 `claude-science` 二进制调用）。
+/// 本地模式（macOS / Windows）需要（依赖 `claude-science` 二进制调用）。
 /// Science 的 `url` 命令会输出多行（第一行是真 URL，随后行是「single-use…」说明）；把整段
-/// stdout 当 URL 交给 `open` 会带上换行与说明文字 → 打开错误入口、nonce 不被正确消费 → 落到
+/// stdout 当 URL 交给浏览器会带上换行与说明文字 → 打开错误入口、nonce 不被正确消费 → 落到
 /// `/login`（修 0.2.1 Bug1）。故逐行找第一条以 `http://`/`https://` 开头的行，并只取该行首个
 /// 非空白 token（URL 内不含空白，若同行尾随了说明也被切掉）。找不到返回 None。
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn first_http_url(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
         let t = line.trim();
@@ -1174,27 +1528,18 @@ fn first_http_url(stdout: &str) -> Option<String> {
     None
 }
 
-/// 取沙箱 UI 链接：`<bin> url --data-dir <home>/.claude-science`，HOME 指向沙箱 HOME。
-/// 仅 macOS 调用（one_click_login 的 macOS 路径）。非 macOS 平台编译通过但无调用方。
+/// 取沙箱 UI 链接：`<bin> url --data-dir <home>/.claude-science`，HOME/USERPROFILE 指向
+/// 沙箱 HOME。本地模式（macOS / Windows）调用（one_click_login）。
 /// 失败退回 http://127.0.0.1:<port>。沙箱 HOME 用 [`sandbox_home`]（与 launch 时一致）。
-#[allow(dead_code)]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn sandbox_url(port: u16) -> String {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return format!("http://127.0.0.1:{port}");
-    }
-    #[cfg(target_os = "macos")]
-    {
-    let home = sandbox_home();
-    let data_dir = home.join(".claude-science");
-    if Path::new(SCIENCE_BIN).is_file() {
-        if let Ok(out) = Command::new(SCIENCE_BIN)
-            .arg("url")
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .env("HOME", &home)
-            .output()
-        {
+    if let Some(bin) = science_bin_any() {
+        let home = sandbox_home();
+        let data_dir = home.join(".claude-science");
+        let mut cmd = Command::new(&bin);
+        cmd.arg("url").arg("--data-dir").arg(&data_dir);
+        science_cli_env(&mut cmd, &home);
+        if let Ok(out) = cmd.output() {
             let s = String::from_utf8_lossy(&out.stdout);
             // 只取第一条合法 URL（修 0.2.1 Bug1）：url 命令多行输出里第一行才是真 URL。
             if let Some(url) = first_http_url(&s) {
@@ -1203,32 +1548,20 @@ fn sandbox_url(port: u16) -> String {
         }
     }
     format!("http://127.0.0.1:{port}")
-    } // #[cfg(target_os = "macos")]
 }
 
-/// 判断「我们自己的」沙箱 Science 是否在跑（供一键健康分派）。收紧（P2 GPT 复审）：优先用
-/// Science 二进制按【我们的 data-dir】查 `{"running":true}`，这是强身份——不会被恰好占用
-/// `port` 且返回 200 的冒名服务骗过；再叠加端口 /health 确认确实在服务。二进制不在（纯 dev /
-/// 研究者机器）时退化为仅端口探活（原行为）。
-/// 仅 macOS 调用（one_click_login/status 的 macOS 路径）。非 macOS 退化为纯端口探活。
-#[allow(dead_code)]
+/// 判断「我们自己的」沙箱 Science 是否在跑（供一键健康分派与 status 灯）。收紧（P2 GPT 复审）：
+/// 优先用 Science CLI 按【我们的 data-dir】查 `{"running":true}`，这是强身份——不会被恰好
+/// 占用 `port` 且返回 200 的冒名服务骗过；再叠加端口 /health 确认确实在服务。二进制不在
+/// （远程模式 / helper 构建）时退化为仅端口探活（原行为）。status() 在所有平台调用本函数。
 fn sandbox_running_ours(port: u16) -> bool {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return proc::http_health(port, None, 400);
-    }
-    #[cfg(target_os = "macos")]
-    {
-    let home = sandbox_home();
-    let data_dir = home.join(".claude-science");
-    if Path::new(SCIENCE_BIN).is_file() {
-        match Command::new(SCIENCE_BIN)
-            .arg("status")
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .env("HOME", &home)
-            .output()
-        {
+    if let Some(bin) = science_bin_any() {
+        let home = sandbox_home();
+        let data_dir = home.join(".claude-science");
+        let mut cmd = Command::new(&bin);
+        cmd.arg("status").arg("--data-dir").arg(&data_dir);
+        science_cli_env(&mut cmd, &home);
+        match cmd.output() {
             Ok(out) => {
                 let s = String::from_utf8_lossy(&out.stdout);
                 // 审核 P2-8 修复：用 serde_json 解析而非 contains 字符串匹配（避免嵌套误判）。
@@ -1242,7 +1575,6 @@ fn sandbox_running_ours(port: u16) -> bool {
         }
     }
     proc::http_health(port, None, 400)
-    } // #[cfg(target_os = "macos")]
 }
 
 #[tauri::command]
@@ -1512,13 +1844,13 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    // first_http_url 和 sandbox_home 仅 macOS 编译，测试也仅在 macOS 运行。
-    #[cfg(target_os = "macos")]
+    // first_http_url 和 sandbox_home 在本地模式平台（macOS/Windows）编译，测试同门。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use super::{first_http_url, sandbox_home};
     use super::{key_fingerprint, redact};
 
-    /// 测试 URL 解析（仅 macOS，依赖 first_http_url）。
-    #[cfg(target_os = "macos")]
+    /// 测试 URL 解析（本地模式平台，依赖 first_http_url）。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn first_http_url_takes_only_first_valid_url() {
         // Science 的 `url` 命令输出两行：第一行是真 URL，第二行是「single-use…」说明。
@@ -1570,16 +1902,32 @@ mod tests {
         assert_ne!(key_fingerprint(""), key_fingerprint("x"));
     }
 
-    /// 测试 sandbox_home 路径（仅 macOS，依赖 sandbox_home 函数）。
-    #[cfg(target_os = "macos")]
+    /// 测试 sandbox_home 路径（本地模式平台，依赖 sandbox_home 函数）。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn sandbox_home_is_writable_under_config_dir() {
         // 沙箱状态目录必须在可写的 ~/.csswitch 下（不在只读的 .app 资源里）——P1-1。
         let h = sandbox_home();
+        // Path::ends_with 按路径分量比较（Windows 的 \ 分隔符同样命中）。
         assert!(h.ends_with("sandbox/home"), "应以 sandbox/home 结尾：{h:?}");
         assert!(
             h.to_string_lossy().contains(".csswitch"),
             "应在 .csswitch 下：{h:?}"
+        );
+    }
+
+    /// Windows：定位已安装的 Claude Science CLI（本机装有官方安装版；未安装则跳过）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn science_bin_windows_finds_installed_cli() {
+        let Some(bin) = super::science_bin_windows() else {
+            return;
+        };
+        assert!(bin.is_file(), "定位到的 CLI 必须存在：{bin:?}");
+        let s = bin.to_string_lossy();
+        assert!(
+            s.ends_with(".com") || s.ends_with(".exe"),
+            "应是 .com shim 或 .exe：{bin:?}"
         );
     }
 }

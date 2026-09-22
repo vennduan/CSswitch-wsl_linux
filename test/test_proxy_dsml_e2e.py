@@ -77,7 +77,23 @@ def start_dsml_upstream():
                 c, _ = srv.accept()
             except OSError:
                 return
-            req = c.recv(65536)
+            # Windows 上 header/body 常分两个 TCP 段到达，单次 recv 会拿到不完整请求；
+            # 读到头部分隔符且 body 满足 Content-Length 才算收全。
+            req = b""
+            while True:
+                d = c.recv(65536)
+                if not d:
+                    break
+                req += d
+                head, sep, body = req.partition(b"\r\n\r\n")
+                if not sep:
+                    continue
+                clen = 0
+                for ln in head.split(b"\r\n"):
+                    if ln.lower().startswith(b"content-length:"):
+                        clen = int(ln.split(b":", 1)[1].strip())
+                if len(body) >= clen:
+                    break
             is_stream = b'"stream": true' in req or b'"stream":true' in req
             if is_stream:
                 sse = _build_sse()
