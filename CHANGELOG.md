@@ -4,6 +4,55 @@
 
 > **约定**：已修问题从 [`docs/known-issues.md`](docs/known-issues.md)「毕业」到这里（发布即定稿）；未修/进行中留在 known-issues；硬 bug 的根因证据链存在 [`findings/`](findings/)。
 
+## [Unreleased]
+
+> 主题：**Windows 本地模式真机修复**。`52408e1` 加入 Windows 本地模式后从未在任何真机上验证过，
+> 本轮把它放到客户 Windows 机器上跑通，定位并修复 8 个问题。其中一条是铁律级：沙箱一直没能用上
+> 伪造登录，而是回退去读**用户真实凭证目录**。
+
+### 修复 Fixed
+- **沙箱根本没用上伪造登录（铁律级）**：`--data-dir` 只覆盖 `data_dir`，而 Science 的 `auth_dir`
+  （登录态所在）默认取 `os.homedir()/.claude-science`。Windows 上 `os.homedir()` 读 `USERPROFILE`，
+  而我们为不破坏 winsbx 护栏刻意不覆盖 `USERPROFILE`，于是 `auth_dir` 落到**真实凭证目录**——
+  沙箱里伪造的 `.oauth-tokens/*.enc` 根本不被读取，`/api/auth/status` 恒为未登录，用户看到登录页。
+  连带后果：真实目录里存在真实 token 时，Science 会**直接使用用户的真实账号运行**，违反铁律 1/2；
+  「Windows 上登录一次就行」这一现象的真实成因即在此。现写入 `config.toml` 用 `[paths] auth_dir`
+  把登录态钉回沙箱，并给 `serve` / `url` / `stop` 三处都补 `--config`。
+  真机验证：`/api/auth/status` 返回 `authenticated:true`（伪造身份 `virtual@localhost.invalid`），
+  浏览器点击 Sign in 后进入完整工作区。
+- **每 2.5 秒闪一个 DOS 窗口**：app 是 GUI 子系统程序，spawn 控制台子进程时未设 `CREATE_NO_WINDOW`，
+  Windows 会为其另开控制台窗口；而状态轮询每 2.5 秒跑一次 `claude-science status`，于是窗口按轮询节奏
+  反复闪现。19 处 spawn 统一加抑制。
+- **整机卡顿但 CPU/内存不高**：同源——每次 `CreateProcess` 都要过 Defender/杀软钩子并同步等待，
+  持续高频 spawn 累积成卡顿，而时间都花在等待上故 CPU/内存不高。现改为端口无响应时直接返回、
+  完全不 spawn 子进程，并对身份校验结果缓存 10 秒。真机验证：40 秒静置采样，子进程创建 0 次。
+- **窗口未响应、关不掉**：Tauri v2 的同步 command 跑在主线程，`status()` 内部无期限等待子进程时，
+  窗口停止重绘、连关闭消息都处理不了。现把 `status` / `stop_all` / `one_click_login` 改为 `async`，
+  子进程调用统一有界（5–8 秒上限）。
+- **并发轮询风暴**：`async` 化之后请求可并发进入，每次都会 spawn 一次子进程。现加单飞锁 + 前端
+  in-flight 开关，确保任意时刻只有一个身份校验在跑。
+- **装有 Python 却报「缺少解释器」**：`find_exe` 每个候选名只取 PATH 第一个命中，Windows Store 的
+  执行别名（`WindowsApps\python.exe`，静默退出）排在前面就把真解释器挡死。现改为遍历 PATH 全部
+  同名候选并逐个 `--version` 验证。
+- **「停止」谎报成功**：`claude-science stop` 退出码 0 不代表 daemon 已死（stale lockfile 时同样返回 0），
+  残留 daemon 会继续占端口导致下次启动报「端口被占用」。现停止后实测端口是否真的释放，未释放如实报错。
+- **把自己起的沙箱误判成冒名服务**：起沙箱后先探 `/health`、立刻查身份，中间无重试；daemon 尚未登记完时
+  会拿到 `running:false`，于是把自己刚起的沙箱杀掉并报「端口有服务响应但不是本沙箱 Science」。
+  现强身份确认绕过缓存重试 8 秒。
+
+### 新增 Added
+- **内置 Linux helper**：`desktop/src-tauri/helper-assets/` 此前只有 `.gitkeep`，而实测 v0.3.3 与 v0.8.4
+  两个 release 的资产里都没有 `csswitch-helper-linux-*`，WSL/远程模式必然下载失败。现将 WSL 编译出的
+  `csswitch-helper-linux-x86_64`（ELF 64-bit）随仓库分发，使 WSL 模式不再依赖 GitHub 下载。
+
+### 说明 Notes
+- 本轮全部结论均来自真机验证（客户 Windows 机器 + 本机沙箱复现），非静态推断。
+- 仍未解决：nonce 首次打开时 Science 返回带「Sign in」按钮的中转页，需用户每次启动手点一次，
+  尚未处理（详见 known-issues #13）。
+- 上游 `SuperJJ007/CSSwitch` 已发布至 v0.8.4，且 README 声明「公开桌面包目前只支持 macOS Apple Silicon」，
+  其 Science runtime 中 `target_os = "windows"` 出现 0 次。本分支的 Windows 本地模式与 WSL 远程目标
+  是上游不具备的能力，两者暂无共同祖先，合并需按「移植」而非「合并」处理（详见 known-issues #14）。
+
 ## [0.3.3] — 2026-07-06
 
 > 主题：**跨平台桌面构建 + 远程 Linux Helper**。这一版把 CSSwitch 从 Apple Silicon 单平台包推进到 Windows x64 / Windows arm64 / macOS arm64 三类桌面安装包，并把远程 Linux helper 做成 x86_64 / aarch64 两个静态产物，方便在 Windows 桌面里一键准备远程服务器上的 Science 沙箱。版本同时补齐 GitHub Actions 发版矩阵和 macOS 编译回归，后续可以通过 `v*` tag 自动构建并发布。

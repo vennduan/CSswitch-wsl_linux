@@ -9,6 +9,23 @@ use serde::Deserialize;
 use serde_json::json;
 use tauri::{Manager, State};
 
+/// spawn 子进程时压制控制台窗口。
+///
+/// 本 app 是 GUI 子系统程序（`windows_subsystem = "windows"`），Windows 规则下它拉起的
+/// 控制台子进程会各自新开一个可见控制台窗口。状态轮询每 2.5s 跑一次
+/// `claude-science status`，于是 DOS 窗口按轮询节奏不停闪。`CREATE_NO_WINDOW` 消掉它。
+///
+/// 注意此 flag **不被孙进程继承**：`bash launch-*.sh` 内部再拉起的程序仍需自行处理。
+#[cfg(target_os = "windows")]
+fn hidden(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+}
+#[cfg(not(target_os = "windows"))]
+fn hidden(cmd: &mut Command) -> &mut Command {
+    cmd
+}
+
 /// Claude Science 二进制路径，仅 macOS 本地模式有效。
 #[cfg(target_os = "macos")]
 const SCIENCE_BIN: &str = "/Applications/Claude Science.app/Contents/Resources/bin/claude-science";
@@ -68,6 +85,28 @@ fn science_bin_windows() -> Option<PathBuf> {
 /// 真机冒烟已验证：HOME-only 覆盖 + --data-dir 即可完整 arming，真实目录零改动。
 fn science_cli_env(cmd: &mut Command, home: &Path) {
     cmd.env("HOME", home);
+}
+
+/// 写一份 Science 的 config.toml，把 `[paths] auth_dir` 钉到沙箱，并返回其路径。
+///
+/// **这是 Windows 本地模式能否工作的关键。** Science 的 `auth_dir`（登录态所在）
+/// 默认取 `os.homedir()/.claude-science`，而 Windows 的 `os.homedir()` 读 `USERPROFILE`
+/// ——我们为不破坏 winsbx 护栏刻意不覆盖 `USERPROFILE`，于是 `auth_dir` 落到**真实凭证目录**，
+/// 沙箱里伪造的 `.oauth-tokens/*.enc` 根本不被读取，`/api/auth/status` 恒为未登录。
+/// `--data-dir` **只**设 `data_dir`，不设 `auth_dir`，所以必须另给 `--config`。
+/// 真机验证：加上本配置后 `/api/auth/status` 返回 `authenticated:true`（伪造身份）。
+#[cfg(target_os = "windows")]
+fn write_science_config(auth_dir: &Path) -> Result<PathBuf, String> {
+    // TOML 用正斜杠，避开反斜杠转义；路径里不含引号，Windows 合法路径不会引号。
+    let p = auth_dir.to_string_lossy().replace('\\', "/");
+    let cfg_path = sandbox_home().join("science-config.toml");
+    let body = format!("[paths]\nauth_dir = \"{p}\"\n");
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建沙箱配置目录失败：{e}"))?;
+    }
+    std::fs::write(&cfg_path, body.as_bytes())
+        .map_err(|e| format!("写 Science 配置失败：{e}"))?;
+    Ok(cfg_path)
 }
 
 #[derive(Default)]
@@ -269,9 +308,32 @@ fn tail_file(path: &Path, max: usize) -> String {
 }
 
 fn kill_child(slot: &mut Option<Child>) {
-    if let Some(mut c) = slot.take() {
+    kill_owned(slot.take())
+}
+
+/// 终止子进程（值语义版，供不持锁的停止路径使用）。
+fn kill_owned(c: Option<Child>) {
+    if let Some(mut c) = c {
         let _ = c.kill();
         let _ = c.wait();
+    }
+}
+
+/// 轮询等待端口真正不再响应，超时返回 false。
+///
+/// 停止流程必须用它做**实证**：CLI 退出码 0 只说明命令跑完了，不代表 daemon 死了
+/// （stale lockfile 时 `claude-science stop` 同样返回 0）。不实测就会向用户谎报
+/// 「已停止」，而残留 daemon 继续占着端口，下次启动报「端口被占用」。
+fn wait_port_free(port: u16, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !proc::http_health(port, None, 300) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(150));
     }
 }
 
@@ -296,7 +358,7 @@ fn open_in_browser(url: &str) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let st = Command::new("cmd")
+        let st = hidden(&mut Command::new("cmd"))
             .args(["/c", "start", url])
             .status()
             .map_err(|e| format!("打开浏览器失败：{e}"))?;
@@ -348,7 +410,10 @@ fn find_python() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         for name in ["python3.exe", "python.exe", "python3", "python"] {
-            if let Some(p) = proc::find_exe(name) {
+            // 关键：遍历 PATH 里的【全部】同名候选，而不是只取第一个。
+            // 靠前的 WindowsApps 商店别名（python.exe 静默退出、无输出）会把后面
+            // 真正可用的解释器挡死——只查第一个会让本机明明装着 Python 却报「缺少解释器」。
+            for p in proc::which_all(name) {
                 if python_works(&p) {
                     return Some(p);
                 }
@@ -366,7 +431,7 @@ fn find_python() -> Option<PathBuf> {
 /// （stdout；stub 无输出则看 stderr）含 "Python" 才算可用（真实解释器形如 "Python 3.12.4"）。
 #[cfg(target_os = "windows")]
 fn python_works(p: &Path) -> bool {
-    let out = match Command::new(p)
+    let out = match hidden(&mut Command::new(p))
         .arg("--version")
         .stdin(Stdio::null())
         .output()
@@ -443,7 +508,7 @@ fn ensure_proxy(
         #[cfg(target_os = "windows")]
         {
             let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
-            let _ = Command::new("powershell")
+            let _ = hidden(&mut Command::new("powershell"))
                 .args([
                     "-NoProfile",
                     "-NonInteractive",
@@ -464,6 +529,7 @@ fn ensure_proxy(
         let mut logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(&py);
+        hidden(&mut cmd);
         cmd.arg(&script)
             .arg("--provider")
             .arg(&launch.adapter)
@@ -522,15 +588,30 @@ fn ensure_proxy(
 /// macOS：调 stop 脚本；Windows：调 Science CLI `stop --data-dir`（按 data-dir 停，绝不碰
 /// 真实实例）；其他平台本地沙箱不存在，直接清 state 返回 Ok。
 fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
+    let sandbox = st.sandbox.take();
+    let port = st.sandbox_port;
+    st.sandbox_url = None;
+    stop_sandbox_detached(app, sandbox, port)
+}
+
+/// 停止沙箱的实际工作：接收 child 句柄与端口，**不接触 AppState**。
+///
+/// 拆出来是为了让调用方能在**不持全局 Mutex** 的前提下做这些阻塞的子进程调用——
+/// Tauri 同步 command 跑在主线程，持锁阻塞会让每 2.5s 轮询一次的 `status` 全部排队，
+/// 表现为整个窗口「未响应」。
+fn stop_sandbox_detached(
+    app: &tauri::AppHandle,
+    sandbox: Option<Child>,
+    port: u16,
+) -> Result<(), String> {
     // 沙箱由脚本以 --detached 起 Science，本进程持有的是脚本 child（已退出）。
     // 真正停 Science 要调 stop 脚本（按 data-dir，绝不碰真实 8765）。
-    // 修 P1（GPT 复审）：定位不到资源根 / 停止脚本时，绝不静默返回成功——detached 沙箱
+    // 修 P1（GPT 复审）：定位不到资源根 / 停止脚本时，绝不静退返回成功——detached 沙箱
     // 可能仍在跑，谎报「已停止」会让「切官方模式」误以为第三方链路已拆。此时如实报错。
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = app;
-        kill_child(&mut st.sandbox);
-        st.sandbox_url = None;
+        let _ = (app, port);
+        kill_owned(sandbox);
         return Ok(());
     }
     #[cfg(target_os = "windows")]
@@ -543,14 +624,18 @@ fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
             Some(bin) => {
                 let home = sandbox_home();
                 let mut cmd = Command::new(&bin);
+                hidden(&mut cmd);
                 cmd.arg("stop")
                     .arg("--data-dir")
                     .arg(home.join(".claude-science"));
+                if let Ok(c) = write_science_config(&home.join(".claude-science")) {
+                    cmd.arg("--config").arg(c);
+                }
                 science_cli_env(&mut cmd, &home);
-                match cmd.stdout(Stdio::null()).stderr(Stdio::null()).status() {
-                    Ok(s) if s.success() => {}
-                    Ok(s) => err = Some(format!("停止沙箱命令非零退出（{:?}）。", s.code())),
-                    Err(e) => err = Some(format!("调用停止沙箱命令失败：{e}")),
+                // 有界执行：残留 daemon 占着 data-dir 锁文件时 stop 会挂住，
+                // 裸 .status() 会无限期阻塞调用方。
+                if proc::run_bounded(cmd, Duration::from_secs(8)).is_none() {
+                    err = Some("停止沙箱命令超时无响应。".to_string());
                 }
             }
             None => {
@@ -562,8 +647,16 @@ fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
         }
         // 兜底：若 --detached 未生效、本进程持有的就是 daemon 本体，kill 之（stale lockfile
         // 由下次 `stop` 的「no daemon running」语义兜住）。
-        kill_child(&mut st.sandbox);
-        st.sandbox_url = None;
+        kill_owned(sandbox);
+        // 实证：命令退出码为 0 **不等于**端口已释放（stale lockfile 时 stop 同样返回 0）。
+        // 不实测就会谎报「已停止」，而 daemon 继续占端口，下次启动报「端口被占用」。
+        if port != 0 && !wait_port_free(port, Duration::from_secs(6)) {
+            let msg = format!("沙箱端口 {port} 仍在响应，daemon 可能未停干净。");
+            err = Some(match err {
+                Some(e) => format!("{e} {msg}"),
+                None => msg,
+            });
+        }
         match err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -576,7 +669,7 @@ fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
         Some(root) => {
             let stop = root.join("scripts/stop-science-sandbox.sh");
             if stop.is_file() {
-                match Command::new("bash") // stop 脚本 #!/usr/bin/env bash（跨 macOS/Git Bash 可执行）
+                match hidden(&mut Command::new("bash")) // stop 脚本 #!/usr/bin/env bash（跨 macOS/Git Bash 可执行）
                     .arg(&stop)
                     // 与 launch 时一致的可写沙箱 HOME，stop 才能按同一 data-dir 停对进程。
                     .env("SANDBOX_HOME", sandbox_home())
@@ -602,8 +695,14 @@ fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
             );
         }
     }
-    kill_child(&mut st.sandbox);
-    st.sandbox_url = None;
+    kill_owned(sandbox);
+    if port != 0 && !wait_port_free(port, Duration::from_secs(6)) {
+        let msg = format!("沙箱端口 {port} 仍在响应，daemon 可能未停干净。");
+        err = Some(match err {
+            Some(e) => format!("{e} {msg}"),
+            None => msg,
+        });
+    }
     match err {
         Some(e) => Err(e),
         None => Ok(()),
@@ -761,7 +860,7 @@ fn open_official() -> Result<(), String> {
         )?;
         // `start` 后跟空标题，路径含空格可整体带引号。防御性：显式抹掉任何 ANTHROPIC_*，
         // 杜绝把改过的环境变量带进真实实例（铁律 3）。
-        let st = Command::new("cmd")
+        let st = hidden(&mut Command::new("cmd"))
             .args(["/c", "start", ""])
             .arg(&lnk)
             .env_remove("ANTHROPIC_BASE_URL")
@@ -1187,12 +1286,19 @@ fn verify_key(
 }
 
 #[tauri::command]
-fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    let mut st = lock(&state);
+async fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<(), String> {
+    // 持锁期间只搬走句柄/字段；所有阻塞的子进程调用都在锁外做完。
+    // 否则本命令会占着全局 Mutex 等子进程退出，而前端每 2.5s 轮询一次 status()
+    // 也要这把锁 → 全部排队 → 窗口「未响应」。
+    let (sandbox, proxy, port) = {
+        let mut st = lock(&state);
+        st.sandbox_url = None;
+        st.secret.clear();
+        (st.sandbox.take(), st.proxy.take(), st.sandbox_port)
+    };
     // 先停沙箱并记录结果；代理无论如何都杀。沙箱没停干净则如实返错，不虚报成功。
-    let sandbox_res = stop_sandbox_inner(&app, &mut st);
-    kill_child(&mut st.proxy);
-    st.secret.clear();
+    let sandbox_res = stop_sandbox_detached(&app, sandbox, port);
+    kill_owned(proxy);
     sandbox_res.map_err(|e| format!("代理已停；但{e}真实实例 8765 未受影响。"))
 }
 
@@ -1200,7 +1306,7 @@ fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<
 /// macOS：经 launch/stop 脚本；Windows：原生 `claude-science serve --detached`（独立
 /// data-dir + HOME/USERPROFILE，铁律 3）。其他平台应使用远程模式 (`remote_*` 命令)。
 #[tauri::command]
-fn one_click_login(
+async fn one_click_login(
     app: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
@@ -1290,7 +1396,7 @@ fn one_click_login(
         );
     }
     let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-    let status = Command::new("bash") // launch 脚本 #!/usr/bin/env bash（跨 macOS/Git Bash 可执行）
+    let status = hidden(&mut Command::new("bash")) // launch 脚本 #!/usr/bin/env bash（跨 macOS/Git Bash 可执行）
         .arg(&launch)
         .arg("--port")
         .arg(sport.to_string())
@@ -1435,9 +1541,13 @@ fn one_click_login(
     }
     let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(&bin);
+    hidden(&mut cmd);
     cmd.arg("serve")
         .arg("--data-dir")
         .arg(&auth_dir)
+        // auth_dir 必须在 config 里指回沙箱，否则 Science 去真实目录读登录态（铁律 1/2）。
+        .arg("--config")
+        .arg(write_science_config(&auth_dir)?)
         .arg("--port")
         .arg(sport.to_string())
         .arg("--no-browser")
@@ -1481,7 +1591,8 @@ fn one_click_login(
 
     // 5b. 身份确认（修 P2 GPT 复审）：/health 200 只证明端口在服务，不证明是我们的 Science。
     // 按 data-dir 强身份再确认一次；不是我们的 → 当启动失败处理，停掉并如实报错。
-    if !sandbox_running_ours(sport) {
+    // 重试 8s：daemon 刚起来时 CLI 可能还没登记完，误判会把自己起的沙箱杀掉。
+    if !sandbox_identity_confirmed(sport, Duration::from_secs(8)) {
         {
             let mut st = lock(&state);
             let _ = stop_sandbox_inner(&app, &mut st);
@@ -1537,10 +1648,13 @@ fn sandbox_url(port: u16) -> String {
         let home = sandbox_home();
         let data_dir = home.join(".claude-science");
         let mut cmd = Command::new(&bin);
+        hidden(&mut cmd);
         cmd.arg("url").arg("--data-dir").arg(&data_dir);
+        if let Ok(c) = write_science_config(&data_dir) {
+            cmd.arg("--config").arg(c);
+        }
         science_cli_env(&mut cmd, &home);
-        if let Ok(out) = cmd.output() {
-            let s = String::from_utf8_lossy(&out.stdout);
+        if let Some(s) = proc::run_bounded(cmd, Duration::from_secs(8)) {
             // 只取第一条合法 URL（修 0.2.1 Bug1）：url 命令多行输出里第一行才是真 URL。
             if let Some(url) = first_http_url(&s) {
                 return url;
@@ -1554,31 +1668,97 @@ fn sandbox_url(port: u16) -> String {
 /// 优先用 Science CLI 按【我们的 data-dir】查 `{"running":true}`，这是强身份——不会被恰好
 /// 占用 `port` 且返回 200 的冒名服务骗过；再叠加端口 /health 确认确实在服务。二进制不在
 /// （远程模式 / helper 构建）时退化为仅端口探活（原行为）。status() 在所有平台调用本函数。
-fn sandbox_running_ours(port: u16) -> bool {
+fn sandbox_identity(port: u16, use_cache: bool) -> bool {
+    // 先做便宜的 TCP 探活：端口都没响应时**直接返回，绝不 spawn 子进程**。
+    // 前端每 2.5s 轮询一次，而 Windows 上每次 CreateProcess 都要过 Defender / 杀软钩子并
+    // 同步等待——持续高频 spawn 是「配置很好但整机很卡、CPU/内存却不高」的来源
+    // （瓶颈在进程创建开销，不在计算）。空闲态下这个短路让每轮 spawn 次数归零。
+    if !proc::http_health(port, None, 400) {
+        return false;
+    }
     if let Some(bin) = science_bin_any() {
+        // 端口有响应时才需要 CLI 做强身份校验（防止冒名服务）。该校验要 spawn 进程，
+        // 故缓存结果 TTL=10s：身份在两次校验之间不会变，没必要每 2.5s 付一次 spawn 代价。
+        static IDENTITY: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new(None);
+        // 单飞锁：同一时刻只允许**一个**身份校验在跑。
+        // 这条是 async 化之后必须补的——同步 command 跑在主线程上天然串行，而 async
+        // command 可以并发进入；前端每 2.5s 轮询、单次最长阻塞 5s，一旦并发就会各自
+        // spawn 一次子进程，N 个并发轮询 = N 倍 CreateProcess 风暴（还要各过一次杀毒
+        // 软件），足以把整机拖死。持锁期间只有首个调用者真正 spawn，其余等锁后命中缓存。
+        static INFLIGHT: Mutex<()> = Mutex::new(());
+        const TTL: Duration = Duration::from_secs(10);
+        if use_cache {
+            let g = IDENTITY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((at, v)) = *g {
+                if at.elapsed() < TTL {
+                    return v;
+                }
+            }
+        }
+        let _flight = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        // 等锁期间可能已被别人填好缓存，再查一次避免重复 spawn。
+        if use_cache {
+            let g = IDENTITY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((at, v)) = *g {
+                if at.elapsed() < TTL {
+                    return v;
+                }
+            }
+        }
         let home = sandbox_home();
         let data_dir = home.join(".claude-science");
         let mut cmd = Command::new(&bin);
+        hidden(&mut cmd);
         cmd.arg("status").arg("--data-dir").arg(&data_dir);
         science_cli_env(&mut cmd, &home);
-        match cmd.output() {
-            Ok(out) => {
-                let s = String::from_utf8_lossy(&out.stdout);
+        // 走有界执行：残留 daemon 占着 data-dir 时 status 可能挂住。
+        let running = match proc::run_bounded(cmd, Duration::from_secs(5)) {
+            Some(s) => {
                 // 审核 P2-8 修复：用 serde_json 解析而非 contains 字符串匹配（避免嵌套误判）。
-                let running = serde_json::from_str::<serde_json::Value>(&s)
+                serde_json::from_str::<serde_json::Value>(&s)
                     .map(|v| v.get("running").and_then(|r| r.as_bool()).unwrap_or(false))
-                    .unwrap_or(false);
-                return running && proc::http_health(port, None, 400);
+                    .unwrap_or(false)
             }
-            // 二进制在但调用失败 → 保守退化到端口探活，别因探测本身出错就误判没起。
-            Err(_) => return proc::http_health(port, None, 400),
-        }
+            // 调用失败/超时 → 保守退化到端口探活（端口已确认有响应）。
+            None => true,
+        };
+        let mut g = IDENTITY.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some((std::time::Instant::now(), running));
+        return running;
     }
-    proc::http_health(port, None, 400)
+    true
 }
 
+/// 轮询用的宽松身份判定（吃 TTL 缓存）。
+fn sandbox_running_ours(port: u16) -> bool {
+    sandbox_identity(port, true)
+}
+
+/// 启动后的强身份确认：**绕过缓存并重试**。
+///
+/// 端口探活通过 ≠ CLI 已登记完 daemon。刚 `serve --detached` 起来的几秒内，
+/// `claude-science status` 可能仍报 `running:false`。此时若直接判定「不是本沙箱」，
+/// 就会把刚起好的沙箱当成冒名服务杀掉并报错（客户现场即此症状）。
+/// 必须 `use_cache=false`——否则重试只会反复读到刚写入的 false 缓存，永远不成功。
+fn sandbox_identity_confirmed(port: u16, wait: Duration) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if sandbox_identity(port, false) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
+/// 状态轮询。**必须 async**：Tauri v2 的同步 command 在主线程执行，而本命令内部要 spawn
+/// `claude-science status` 子进程。同步执行时，一旦那个子进程挂住（残留 daemon 占着
+/// data-dir 锁文件、CLI 自身卡死），主线程就一直等 → 窗口停止重绘、连关闭按钮都不响应。
+/// 声明 async 让它离开主线程，卡住也只影响这一次的返回值，不再冻结 UI。
 #[tauri::command]
-fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
+async fn status(state: State<'_, Mutex<AppState>>) -> Result<serde_json::Value, String> {
     // 先在锁外加载配置（磁盘 I/O），避免阻塞其他需要锁的命令。
     let cfg = match config::load_from(&config::default_dir()) {
         Ok(c) => c,
@@ -1627,7 +1807,8 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
     } else {
         "amber"
     };
-    json!({ "proxy": proxy, "sandbox": sandbox, "upstream": upstream })
+    // 状态探测永不失败：任何异常都退化成灯色，交给前端显示。
+    Ok(json!({ "proxy": proxy, "sandbox": sandbox, "upstream": upstream }))
 }
 
 #[tauri::command]
@@ -1675,6 +1856,7 @@ fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
         .map(|p| templates::adapter_for(&p.template_id).to_string())
         .unwrap_or_default();
     let mut cmd = Command::new("bash");
+    hidden(&mut cmd);
     cmd.arg(&doctor)
         .env("CSSWITCH_PROVIDER", &adapter)
         .env("CSSWITCH_PROXY_PORT", cfg.proxy_port.to_string())
@@ -1729,7 +1911,7 @@ fn open_logs() -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("explorer")
+        hidden(&mut Command::new("explorer"))
             .arg(&dir)
             .status()
             .map_err(|e| format!("打开日志目录失败：{e}"))?;

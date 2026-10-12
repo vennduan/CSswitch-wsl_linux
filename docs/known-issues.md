@@ -166,3 +166,32 @@
 
 - **三大根因归类**（沿用 2026-07-03 分诊，`findings/2026-07-03-user-reported-bugs-triage.md`）：① 架构边界（claude.ai 服务端功能被 401 隔离）=#3/#5/#8/#9；② 模型端（DeepSeek 透传把 tool_use 吐成文本卡死）=#2/#6 最严重；③ 疑可修代理 bug=#4（输出一晃而过）/#12（自定义校验）/#1（梯子）。
 - **下一步优先级（2026-07-04 更新）**：~~先修 #9 模型选择器~~ **✅ #9 已实现 + 真机验证 + merge 进 main**。剩：① 补 README/About → 走 v0.3.2 发版（版本 bump/tag/dmg/Release）；② #12 校验部分（自定义 scratch 误判）待复现；③ Kimi/MiniMax 已就绪随 v0.3.2 一起发。
+
+## 13. 每次「一键开始」需手动点一次 Sign in（2026-10-12 新记录）
+
+> **状态：待处理。影响 Windows 本地模式与 WSL 模式的首次进入体验。**
+
+- **现象**：app 打开 `?nonce=...` 后，浏览器显示一个只有 "Sign in" 按钮的中转页，
+  用户必须手点一次才进入工作区；此后 `operon_auth` cookie 保持到 daemon 重启，故**每次启动点一次**。
+- **机制**（逆向 Science 0.1.50 确认）：nonce 的 GET 处理在检测到有效 bearer 时直接放行应用，
+  否则返回一个表单页，POST `/api/auth/nonce` 才会签发 `operon_auth`。这是厂商为避免 GET 建立会话
+  做的 CSRF 设计，非 bug。
+- **可选处置**：① 最小改动——在面板成功提示里写明「首次打开请点击页面上的 Sign in」；
+  ② 彻底——尝试免掉这一次点击（跨源 POST 会被 `SameSite=Strict` 拦，需另找路径）。
+
+## 14. 本分支与上游 v0.8.4 无共同祖先，合并需按「移植」处理（2026-10-12 新记录）
+
+> **状态：待决策。不阻塞当前交付，但影响后续同步成本。**
+
+- **事实**：本仓库 `origin` 指向用户 fork `vennduan/CSswitch-wsl_linux`（0.3.3），
+  官方上游是 `SuperJJ007/CSSwitch`（已发布至 v0.8.4）。两者**无共同祖先**，不是 fork 关系。
+- **上游现状**：README 第 132 行声明「公开桌面包目前只支持 macOS Apple Silicon」，
+  其 `desktop/src-tauri/src/runtime/science.rs` 中 `target_os = "windows"` 出现 **0 次**；
+  且已移除 Python 代理（改为 Rust crate `desktop/gateway/`）与整个 `remote/`（wsl/ssh）。
+- **含义**：本分支的 Windows 本地模式与 WSL 远程目标是**上游不具备的能力**，本轮修复不构成重复劳动。
+  但上游在架构上已大幅演进（oauth_forge 1314→1664 行、前端 1453→2865 行、Science 逻辑拆入
+  `runtime/science.rs`），本分支底座偏旧。
+- **合并方式**：不是 merge，是把 Windows/WSL 层**移植**到新底座。移植时需保住上游 macOS 成熟路径，
+  并跟进其 oauth_forge 新增的 `auth_dir_fingerprint` 等逻辑。
+- **风险**：本轮 8 项修复均经真机验证，结论可直接复用（知道该修什么）；但代码本身需按新结构重写，
+  不可直接套用。

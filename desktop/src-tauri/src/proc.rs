@@ -172,6 +172,42 @@ pub fn tcp_reachable(host: &str, port: u16, timeout_ms: u64) -> bool {
 
 /// 在 PATH 里找可执行文件（简易 which），并对 macOS GUI 最小 PATH 做兜底。
 ///
+/// 带超时的子进程执行，超时则 kill 并返回 `None`。
+///
+/// Tauri 的同步 `#[tauri::command]` 跑在**主线程**上，命令里任何一次无期限的
+/// `cmd.output()` 都会冻结整个窗口（表现为「未响应」）。残留 daemon 占着 data-dir
+/// 锁文件时，`claude-science status/url` 可能迟迟不返回——故所有被轮询调用的
+/// 子进程都必须走这里，绝不裸用 `.output()` / `.status()`。
+pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// 从访达 / .app 启动的 GUI 进程拿到的是最小 PATH（`/usr/bin:/bin:/usr/sbin:/sbin`），
 /// **不含** Homebrew(`/usr/local/bin`、`/opt/homebrew/bin`)、nvm / volta / asdf 等
 /// node 常见安装位置 → `which("node")` 在正常 PATH 里查不到（`python3` 因
@@ -195,6 +231,33 @@ pub fn which(name: &str) -> Option<PathBuf> {
         return Some(hit);
     }
     None
+}
+
+/// 按 PATH 顺序返回同名可执行文件的**全部**命中（去重保序）。
+///
+/// [`which`] 只给第一个命中。当 PATH 里靠前的是「假命中」——Windows 上
+/// `...\Microsoft\WindowsApps\python.exe` 商店执行别名（静默退出、无输出）——
+/// 真正的解释器排在后面就再也拿不到了。故需要「挨个试」的调用方必须用这个。
+pub fn which_all(name: &str) -> Vec<PathBuf> {
+    let p = PathBuf::from(name);
+    if p.is_absolute() {
+        return if is_exec(&p) { vec![p] } else { Vec::new() };
+    }
+    let mut out = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for cand in std::env::split_paths(&path).map(|d| d.join(name)) {
+            if is_exec(&cand) && !out.contains(&cand) {
+                out.push(cand);
+            }
+        }
+    }
+    #[cfg(unix)]
+    for cand in common_bin_dirs().into_iter().map(|d| d.join(name)) {
+        if is_exec(&cand) && !out.contains(&cand) {
+            out.push(cand);
+        }
+    }
+    out
 }
 
 /// 在给定目录序列里找可执行文件（第一个命中即返回）。

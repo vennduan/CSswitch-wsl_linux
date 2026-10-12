@@ -697,7 +697,12 @@ async function stopAll() {
   }
 }
 
+// 上一次轮询还没回来就跳过这一拍。status 可能因子进程探测耗时超过 2.5s，无保护时请求会
+// 持续叠加 → 后端并发 spawn 子进程（每次都过一遍杀毒软件），把整机拖到打不开东西。
+let statusInflight = false;
 async function refreshStatus() {
+  if (statusInflight) return;
+  statusInflight = true;
   try {
     const s = target === "remote" && currentProfile
       ? await call("remote_status", { profile: currentProfile })
@@ -708,6 +713,8 @@ async function refreshStatus() {
     els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
   } catch (e) {
     [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((el) => setLight(el, "amber"));
+  } finally {
+    statusInflight = false;
   }
 }
 
