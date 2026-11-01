@@ -1535,11 +1535,155 @@ async fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> R
 /// Science 把自己的 kernel runtime 解到 `runtime/<ver>.tmp-<pid>-<ts>` 再改名到位，
 /// Windows 上这一步会被杀毒软件 / 索引器 / 权限挡住（客户真机 EPERM 复现）。
 fn fatal_sandbox_log(tail: &str) -> bool {
+    unpack_failure_log(tail) || port_conflict_log(tail)
+}
+
+/// runtime 展开类致命错误（可自愈：清残留 + 复制官方 runtime 后重试）。
+fn unpack_failure_log(tail: &str) -> bool {
     tail.contains("Couldn't unpack")
         || tail.contains("console trampoline sync failed")
         || tail.contains("EPERM")
         || tail.contains("rename '")
         || tail.contains("ENOTEMPTY")
+}
+
+/// 端口占用类致命错误（**不可**用 runtime 自愈解决：得先把占端口的进程停掉）。
+///
+/// 客户现场症状：`port 8990 is held by live pid(s) 4812 — not a stale listener`。
+/// 那个 pid 是上一次运行留下的孤儿 daemon（多为管理员身份起的，普通用户 stop 不掉），
+/// 于是新 daemon 前面所有 boot 阶段都正常，最后绑定失败退出——表现成「一直停在启动中」。
+fn port_conflict_log(tail: &str) -> bool {
+    tail.contains("is already in use by another app") || tail.contains("held by live pid(s)")
+}
+
+/// 沙箱端口是否被**别的**进程占着（Windows：查 TCP 监听表的占用 pid）。
+///
+/// 客户现场症状：`port 8990 is held by live pid(s) 4812 — not a stale listener`。
+/// 那个 pid 是上一次运行留下的孤儿 daemon（多为管理员身份起的，普通用户 stop 不掉），
+/// 于是新 daemon 前面所有 boot 阶段都正常，最后绑定失败退出——表现成「一直停在启动中」。
+/// 起之前先查端口：被占就**先停掉占用者（只停本沙箱 data-dir 的 daemon）**，再起。
+#[cfg(target_os = "windows")]
+fn port_owner_pids(port: u16) -> Vec<u32> {
+    let out = hidden(&mut Command::new("netstat")).arg("-ano").output();
+    let Ok(o) = out else { return Vec::new() };
+    let text = String::from_utf8_lossy(&o.stdout);
+    let mut pids = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // TCP  <local> <foreign> <state> <pid>；本地列形如 0.0.0.0:8990 / [::]:8990
+        if cols.len() < 4 || !cols[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        let Some((_, local)) = cols[1].rsplit_once(':') else {
+            continue;
+        };
+        if local != port.to_string() {
+            continue;
+        }
+        if !cols[2].eq_ignore_ascii_case("LISTENING") {
+            continue;
+        }
+        if let Ok(pid) = cols[3].parse::<u32>() {
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
+
+/// 沙箱端口当前是否**没有任何进程**在监听（以 TCP 监听表为准，不用 HTTP 探活——
+/// 后者对「在监听但不应答」的进程会误判为空闲）。
+#[cfg(target_os = "windows")]
+fn sandbox_port_listening(port: u16) -> bool {
+    !port_owner_pids(port).is_empty()
+}
+
+/// 占用端口的进程是不是**本沙箱的** Claude Science daemon（看命令行里是否带沙箱 data-dir）。
+///
+/// 只有确认是自家的才允许强杀；占用者是别的程序时**绝不碰**，只如实报错。
+#[cfg(target_os = "windows")]
+fn owner_is_our_sandbox(pid: u32) -> bool {
+    let script = format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine");
+    let out = hidden(&mut Command::new("powershell"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output();
+    let Ok(o) = out else { return false };
+    let cmdline = String::from_utf8_lossy(&o.stdout);
+    let sandbox = sandbox_home();
+    let needles = [
+        sandbox.to_string_lossy().to_string(),
+        ".csswitch".to_string(),
+    ];
+    cmdline.contains("claude-science") && needles.iter().any(|n| cmdline.contains(n.as_str()))
+}
+
+/// 起沙箱前确认端口空闲：被占则先清掉占用者。
+///
+/// 客户现场症状：`port 8990 is held by live pid(s) 4812 — not a stale listener, not reclaiming`
+/// → 新 daemon 前面所有 boot 阶段都正常，最后绑定失败退出，表面看是「一直停在启动中」。
+/// 那个占用者是**上一次运行残留的 Claude Science daemon**（多为管理员身份起的，
+/// 普通用户权限停不掉）。
+///
+/// 处置顺序：
+/// 1. 按 data-dir 调 `claude-science stop`（**只停本沙箱的**，绝不碰真实实例）；
+/// 2. 端口仍被占且占用者确认是本沙箱的 daemon → 强杀（`taskkill /F`）；
+/// 3. 仍占着 → 如实报错并给出 pid（多半是权限不够：占用者以管理员身份起的）。
+///
+/// 铁律：只按沙箱 data-dir 定位并停止；真实 Science 实例（8765 / 8000）绝不触碰。
+#[cfg(target_os = "windows")]
+fn free_sandbox_port(
+    app: &tauri::AppHandle,
+    state: &State<'_, Mutex<AppState>>,
+    port: u16,
+) -> Option<String> {
+    if !sandbox_port_listening(port) {
+        return None;
+    }
+    // 先按 data-dir 优雅停本沙箱的 daemon（可能正是那个占用者）。
+    {
+        let mut st = lock(state);
+        let _ = stop_sandbox_inner(app, &mut st);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
+        if !sandbox_port_listening(port) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // 还占着：确认是自家的 daemon 就强杀（普通 stop 停不掉的典型是以管理员身份起的）。
+    let owners = port_owner_pids(port);
+    for pid in &owners {
+        if owner_is_our_sandbox(*pid) {
+            let _ = hidden(&mut Command::new("taskkill"))
+                .args(["/F", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        if !sandbox_port_listening(port) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let owners = port_owner_pids(port);
+    if owners.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "沙箱端口 {port} 被另一个程序占用（pid: {}）。通常是上一次运行残留的 Claude Science \
+         进程还没退出。请先点「全部停止」；若仍不行，请用管理员身份运行一次本程序点「全部停止」\
+         （普通权限停不掉以管理员身份启动的进程），或在「高级设置」里换一个沙箱端口。",
+        owners
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// 起沙箱 Science 并探活，失败时按「runtime 展开失败」自愈重试一次。
@@ -1564,6 +1708,15 @@ fn spawn_sandbox_and_probe(
     let mut attempt = 0u8;
     loop {
         attempt += 1;
+
+        // 起之前先看端口有没有被占。客户现场：`port 8990 is held by live pid(s) 4812`——
+        // 那是上一次运行留下的孤儿 daemon（多为管理员身份起的，普通用户 stop 不掉），
+        // 新 daemon 前面所有 boot 阶段都正常，最后绑定失败退出。**先清掉占用者再起**，
+        // 否则每次都要等它跑完整套 boot 才失败。
+        if let Some(msg) = free_sandbox_port(app, state, sport) {
+            return Err(msg);
+        }
+
         // 只看本次启动新产生的日志（上次失败留下的旧尾巴不能用来判断这次）。
         let log_start = std::fs::metadata(log_path("sandbox.log"))
             .map(|m| m.len() as usize)
@@ -1624,7 +1777,8 @@ fn spawn_sandbox_and_probe(
             &tail_file_from(&log_path("sandbox.log"), log_start, 2500),
             secret,
         );
-        let unpack_failed = fatal_sandbox_log(&new_tail);
+        let unpack_failed = unpack_failure_log(&new_tail);
+        let port_conflict = port_conflict_log(&new_tail);
         // 探活失败：停掉刚起的沙箱（不留下孤儿进程），并清掉它可能留下的 runtime 临时目录
         // ——留着它会让下一次启动在同一步失败。
         {
@@ -1632,6 +1786,29 @@ fn spawn_sandbox_and_probe(
             let _ = stop_sandbox_inner(app, &mut st); // best-effort 清理
         }
         clean_sandbox_runtime(false);
+
+        // 端口冲突：runtime 自愈没用（问题在占用者，不在 runtime），直接报清楚。
+        if port_conflict {
+            let owners = port_owner_pids(sport);
+            let who = if owners.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "（占用进程 pid: {}）",
+                    owners
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            return Err(format!(
+                "沙箱端口 {sport} 被另一个程序占用{who}。通常是上一次运行留下的 Claude Science \
+                 进程还没退出。请先点「全部停止」；若仍不行，请用管理员身份运行一次本程序点「全部停止」\
+                 （普通权限停不掉以管理员身份启动的进程），或在「高级设置」里换一个沙箱端口。\
+                 日志：\n{new_tail}"
+            ));
+        }
 
         if attempt == 1 && unpack_failed {
             // 自愈：半成品 runtime 目录会让 Science 下次「改名到位」必失败（EPERM/ENOTEMPTY）。
@@ -2494,5 +2671,31 @@ mod tests {
         assert!(super::clean_runtime_dir(&dir, true), "full 应报告成功");
         assert!(!dir.exists(), "full=true 应删掉整个 runtime 目录");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端口占用日志必须被认成致命错误——客户现场症状是「一直停在启动中」：
+    /// daemon 前面的 boot 阶段全过，最后绑定端口失败退出，程序却白等满 180 秒。
+    #[test]
+    fn port_conflict_log_is_fatal_but_runtime_failure_is_separate() {
+        let conflict = "[claude-science] port 8990 is held by live pid(s) 4812 — not a stale listener, not reclaiming\n\
+                        [claude-science] port 8990 is already in use by another app.";
+        assert!(super::port_conflict_log(conflict), "端口占用必须被识别");
+        assert!(super::fatal_sandbox_log(conflict), "端口占用是致命错误");
+        // 端口占用**不是** runtime 展开失败——不能走 runtime 自愈（清 runtime 没用）。
+        assert!(
+            !super::unpack_failure_log(conflict),
+            "端口占用不应被当成 runtime 展开失败"
+        );
+
+        let unpack = "claude-science: console trampoline sync failed (Couldn't unpack the files \
+                      Claude Science needs ... (EPERM: operation not permitted, rename \
+                      '...runtime\\0.1.50-release.tmp-28292-1793544074523' -> \
+                      '...runtime\\0.1.50-release'))";
+        assert!(super::unpack_failure_log(unpack), "解压失败必须被识别");
+        assert!(super::fatal_sandbox_log(unpack), "解压失败是致命错误");
+        assert!(
+            !super::port_conflict_log(unpack),
+            "解压失败不应被当成端口占用"
+        );
     }
 }
