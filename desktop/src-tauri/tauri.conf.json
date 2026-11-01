@@ -39,9 +39,9 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../../proxy": "proxy",
-      "../../scripts": "scripts",
-      "helper-assets": "helper-assets"
+      "../../proxy/*.py": "proxy",
+      "../../scripts/*": "scripts",
+      "helper-assets/*": "helper-assets"
     },
     "macOS": {
       "signingIdentity": "-"

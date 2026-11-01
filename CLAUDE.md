@@ -65,5 +65,5 @@ findings/                         证据、二进制分析、诊断记录；auto
 
 - 真实 Science 数据目录 `~/.claude-science`、端口 8765，绝对不碰。
 - 上游 key 在用户 shell 环境：`DEEPSEEK_API_KEY` / `DASHSCOPE_API_KEY`（值不显示、不入库）。DashScope 兼容端点 `https://dashscope.aliyuncs.com/compatible-mode/v1`。
-- **代理端口坑（gh/git/operon 都踩，反复中招）**：小写 `https_proxy`/`http_proxy`/`ALL_PROXY`→`127.0.0.1:7890`（**活**）；大写 `HTTPS_PROXY`/`HTTP_PROXY`→`127.0.0.1:8001`（**死，连接被拒**）。gh（Go）读大写 → 连不上 GitHub，**还会把 token 误报 `invalid`（假阴性，别当成要重新登录）**。**跑任何 gh/git 前先**：`export HTTPS_PROXY=http://127.0.0.1:7890 HTTP_PROXY=http://127.0.0.1:7890 ALL_PROXY=http://127.0.0.1:7890`。operon 认小写、本就走 7890。详见记忆 `github-repo`。
+- **代理端口坑（gh/git/operon 都踩）——以实测为准（2026-11-01 复测）**：`127.0.0.1:57468` **活**（curl GitHub 200、git ls-remote 正常）；`127.0.0.1:7890` **死**（curl 返回 000）；**直连 GitHub 也死**（git 直连报 `Recv failure: Connection was reset`）。git 的 `http.proxy` 已写死 57468（global + 本 repo），**git 直接用它即可**；gh（Go）只读大写 `HTTPS_PROXY`/`HTTP_PROXY`，所以跑 gh 前先 `export HTTPS_PROXY=http://127.0.0.1:57468 HTTP_PROXY=http://127.0.0.1:57468 ALL_PROXY=http://127.0.0.1:57468`。**旧记忆里的「清空代理 + 直连」配方现在不成立**（直连不通），别照抄。HTTP/2 被中间设备掐断，必要时加 `-c http.version=HTTP/1.1`。另：连不上 GitHub 时 gh 可能把 token 误报 `invalid`（假阴性，别当成要重新登录）。详见记忆 `git-push-network`。
 - Python 用 conda 环境（见用户全局记忆），避免系统 3.9。
