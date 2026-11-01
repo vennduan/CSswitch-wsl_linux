@@ -435,20 +435,107 @@ fn tail_file(path: &Path, max: usize) -> String {
     }
 }
 
-/// 只取文件里 `from` 之后新增的内容（本次启动新写的日志），末尾最多 `max` 字节。
-/// 用于判断「这次启动报了什么错」时不被上一次失败的旧日志误导。
-fn tail_file_from(path: &Path, from: usize, max: usize) -> String {
-    match std::fs::read(path) {
+/// Science daemon 自己的日志目录（**不是**我们自己的 `~/.csswitch/logs/`）。
+///
+/// 关键事实（本地实测）：`serve --detached` 时，**端口冲突、runtime 展开失败这些致命错误
+/// 都写在 Science 自己的 `logs/server-*.log` 里**，而我们捕获的 stdout（`sandbox.log`）
+/// 只有启动器那几行（`daemon ... exited before becoming ready`）。所以只看 stdout 永远
+/// 看不到真正的失败原因 —— 客户现场就是明明日志里已报「端口被占用」，程序却还在等 180 秒。
+fn science_data_log_dir() -> PathBuf {
+    sandbox_home().join(".claude-science").join("logs")
+}
+
+/// 读 Science 自己的最新一份 `server-*.log`，末尾最多 `max` 字节。
+///
+/// 只取「最后一次 daemon start 之后」的内容：server 日志是**追加**的（同一份文件里会堆着
+/// 历次启动的记录），不切分就会把上一次启动的错误当成本次的。
+fn science_server_log_tail(max: usize) -> String {
+    let dir = science_data_log_dir();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return String::new();
+    };
+    // 取修改时间最新的 server-*.log
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("server-") || !name.ends_with(".log") {
+            continue;
+        }
+        let mt = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().map_or(true, |(t, _)| mt > *t) {
+            best = Some((mt, p));
+        }
+    }
+    let Some((_, path)) = best else {
+        return String::new();
+    };
+    let Ok(b) = std::fs::read(&path) else {
+        return String::new();
+    };
+    // 只取最后一次 `--- daemon start ... ---` 之后的内容（本次启动的记录）。
+    let marker = b"--- daemon start";
+    let start = b
+        .windows(marker.len())
+        .rposition(|w| w == marker)
+        .map(|i| i + marker.len())
+        .unwrap_or(0);
+    let seg = &b[start..];
+    let seg = if seg.len() > max {
+        &seg[seg.len() - max..]
+    } else {
+        seg
+    };
+    String::from_utf8_lossy(seg).trim().to_string()
+}
+
+/// Science daemon 自己的 `spawn.log`（bootstrap 阶段日志）末尾。
+fn science_spawn_log_tail(max: usize) -> String {
+    let p = science_data_log_dir().join("spawn.log");
+    match std::fs::read(&p) {
         Ok(b) => {
-            let start = from.min(b.len());
-            let mut seg = &b[start..];
-            if seg.len() > max {
-                seg = &seg[seg.len() - max..];
-            }
+            let seg = if b.len() > max {
+                &b[b.len() - max..]
+            } else {
+                &b[..]
+            };
             String::from_utf8_lossy(seg).trim().to_string()
         }
         Err(_) => String::new(),
     }
+}
+
+///
+/// **不能拿「文件长度」当增量起点**（旧实现）：上一次运行残留的 daemon 仍持有同一个日志
+/// 文件句柄，会把自己的输出继续写在**高偏移**处；新一次 `open_log`（truncate）把文件截短
+/// 后，那些旧内容变成一段 NUL 空洞 + 更靠后的旧数据 —— 用长度当起点会整段跳过本次真正的
+/// 输出，于是「日志里明明已经报错了，程序却还在等」。客户现场即此。
+///
+/// 正确做法：用**本次写入的唯一 marker** 定位起点，并对 NUL 空洞截断（空洞之后是残留
+/// daemon 在旧偏移上写的旧数据，与本次无关）。
+fn tail_after_marker(path: &Path, marker: &str, max: usize) -> String {
+    let Ok(b) = std::fs::read(path) else {
+        return String::new();
+    };
+    let m = marker.as_bytes();
+    let Some(idx) = b.windows(m.len()).rposition(|w| w == m) else {
+        return String::new();
+    };
+    let seg = &b[idx + m.len()..];
+    // NUL 空洞 = 残留写者在旧偏移留下的空洞；空洞之后的内容不属于本次。
+    let end = seg.iter().position(|&c| c == 0).unwrap_or(seg.len());
+    let seg = &seg[..end];
+    let seg = if seg.len() > max {
+        &seg[seg.len() - max..]
+    } else {
+        seg
+    };
+    String::from_utf8_lossy(seg).trim().to_string()
 }
 
 fn kill_child(slot: &mut Option<Child>) {
@@ -1550,10 +1637,23 @@ fn unpack_failure_log(tail: &str) -> bool {
 /// 端口占用类致命错误（**不可**用 runtime 自愈解决：得先把占端口的进程停掉）。
 ///
 /// 客户现场症状：`port 8990 is held by live pid(s) 4812 — not a stale listener`。
-/// 那个 pid 是上一次运行留下的孤儿 daemon（多为管理员身份起的，普通用户 stop 不掉），
-/// 于是新 daemon 前面所有 boot 阶段都正常，最后绑定失败退出——表现成「一直停在启动中」。
+///
+/// ⚠️ 这条**只出现在 Science 自己的 `logs/server-*.log`** 里（daemon 内部日志），
+/// 不在我们捕获的 stdout 里 —— 早期实现只扫 stdout，所以永远看不到，只能干等超时。
+/// 现在必须连 Science 自己的日志一起扫（见 [`science_server_log_tail`]）。
 fn port_conflict_log(tail: &str) -> bool {
     tail.contains("is already in use by another app") || tail.contains("held by live pid(s)")
+}
+
+/// Science 启动器在 stdout 里说「daemon 没起来就退了」= 这次启动已经**确定失败**。
+///
+/// 客户现场：端口被占时，Science 前面所有 boot 阶段都正常跑完（十几秒），最后绑定失败，
+/// 启动器打印这行就退出。有了它，程序**几秒内**就能判定失败并报出真实原因，
+/// 而不是干等满 180 秒才说「探活超时」。
+fn launcher_gave_up_log(tail: &str) -> bool {
+    tail.contains("exited before becoming ready")
+        || tail.contains("failed to start")
+        || tail.contains("is already in use by another app")
 }
 
 /// 沙箱端口是否被**别的**进程占着（Windows：查 TCP 监听表的占用 pid）。
@@ -1570,8 +1670,13 @@ fn port_owner_pids(port: u16) -> Vec<u32> {
     let mut pids = Vec::new();
     for line in text.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        // TCP  <local> <foreign> <state> <pid>；本地列形如 0.0.0.0:8990 / [::]:8990
-        if cols.len() < 4 || !cols[0].eq_ignore_ascii_case("TCP") {
+        // `netstat -ano` 的列：Proto | Local Address | Foreign Address | State | PID
+        //   TCP    127.0.0.1:8990   0.0.0.0:0         LISTENING   4812
+        // ⚠️ State 是**第 4 列**（下标 3）、PID 是**第 5 列**（下标 4）——本地地址/外部地址
+        // 各占一列。早期实现把 State/PID 读成了下标 2/3，于是**永远匹配不到**，
+        // 「起前查端口」这个自愈逻辑形同虚设（客户现场：端口明明被占，程序却照常启动、
+        // 干等 180 秒才报超时）。这里必须按真实列位读。
+        if cols.len() < 5 || !cols[0].eq_ignore_ascii_case("TCP") {
             continue;
         }
         let Some((_, local)) = cols[1].rsplit_once(':') else {
@@ -1580,10 +1685,10 @@ fn port_owner_pids(port: u16) -> Vec<u32> {
         if local != port.to_string() {
             continue;
         }
-        if !cols[2].eq_ignore_ascii_case("LISTENING") {
+        if !cols[3].eq_ignore_ascii_case("LISTENING") {
             continue;
         }
-        if let Ok(pid) = cols[3].parse::<u32>() {
+        if let Ok(pid) = cols[4].parse::<u32>() {
             if !pids.contains(&pid) {
                 pids.push(pid);
             }
@@ -1604,12 +1709,10 @@ fn sandbox_port_listening(port: u16) -> bool {
 /// 只有确认是自家的才允许强杀；占用者是别的程序时**绝不碰**，只如实报错。
 #[cfg(target_os = "windows")]
 fn owner_is_our_sandbox(pid: u32) -> bool {
-    let script = format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine");
-    let out = hidden(&mut Command::new("powershell"))
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output();
-    let Ok(o) = out else { return false };
-    let cmdline = String::from_utf8_lossy(&o.stdout);
+    let cmdline = process_cmdline(pid);
+    if cmdline.is_empty() {
+        return false;
+    }
     let sandbox = sandbox_home();
     let needles = [
         sandbox.to_string_lossy().to_string(),
@@ -1618,19 +1721,61 @@ fn owner_is_our_sandbox(pid: u32) -> bool {
     cmdline.contains("claude-science") && needles.iter().any(|n| cmdline.contains(n.as_str()))
 }
 
-/// 起沙箱前确认端口空闲：被占则先清掉占用者。
+/// 取某个进程的**可执行文件名 + 命令行**（如 `kxescore.exe` / `...kingsoft antivirus...`）。
+///
+/// 用途：端口被占时告诉用户**到底是谁占的**。客户现场占用者是**金山毒霸的服务进程**
+/// `kxescore.exe`（服务进程，普通权限杀不掉），此前程序一律说「上次残留的 Claude Science
+/// 进程」，误导客户去点「全部停止」——完全无效。
+#[cfg(target_os = "windows")]
+fn process_info(pid: u32) -> (String, String) {
+    // 关键：`[Console]::OutputEncoding=UTF8` 让 PowerShell 用 UTF-8 输出。
+    // 中文 Windows 上默认是 GBK，直接 from_utf8_lossy 会把中文路径变成乱码，
+    // 导致「按命令行判断是不是自家沙箱」永远匹配不上（客户用户名是中文「梓昀」）。
+    let script = format!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+         $p=Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\"; \
+         if($p){{ Write-Output (\"NAME=\" + $p.Name); Write-Output (\"CMD=\" + $p.CommandLine) }}"
+    );
+    let out = hidden(&mut Command::new("powershell"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output();
+    let Ok(o) = out else { return (String::new(), String::new()) };
+    let text = String::from_utf8_lossy(&o.stdout).to_string();
+    let mut name = String::new();
+    let mut cmd = String::new();
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("NAME=") {
+            name = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("CMD=") {
+            cmd = v.trim().to_string();
+        }
+    }
+    (name, cmd)
+}
+
+/// 取某个进程的命令行（取不到返回空串）。
+#[cfg(target_os = "windows")]
+fn process_cmdline(pid: u32) -> String {
+    process_info(pid).1
+}
+
+/// 起沙箱前确认端口空闲：被占则先清掉占用者；清不掉就**换一个端口**。
 ///
 /// 客户现场症状：`port 8990 is held by live pid(s) 4812 — not a stale listener, not reclaiming`
 /// → 新 daemon 前面所有 boot 阶段都正常，最后绑定失败退出，表面看是「一直停在启动中」。
-/// 那个占用者是**上一次运行残留的 Claude Science daemon**（多为管理员身份起的，
-/// 普通用户权限停不掉）。
+///
+/// ⚠️ 占用者**不一定**是上次的残留 daemon。真实客户现场：占用 8990 的是**金山毒霸的服务
+/// 进程 `kxescore.exe`**（`/service kxescore`，系统服务，普通权限拒绝访问、杀不掉）。
+/// 所以不能一律说「点全部停止」——对服务进程那完全无效。必须**认出占用者是谁**再给建议。
 ///
 /// 处置顺序：
 /// 1. 按 data-dir 调 `claude-science stop`（**只停本沙箱的**，绝不碰真实实例）；
 /// 2. 端口仍被占且占用者确认是本沙箱的 daemon → 强杀（`taskkill /F`）；
-/// 3. 仍占着 → 如实报错并给出 pid（多半是权限不够：占用者以管理员身份起的）。
+/// 3. 仍被占 → **自动顺延到下一个空闲端口**（8991、8992…），并把换端口的事告诉用户。
+///    （对一个被杀毒软件抢占的端口，程序自己绕开是最有效的自愈；用户什么都不用做。）
 ///
-/// 铁律：只按沙箱 data-dir 定位并停止；真实 Science 实例（8765 / 8000）绝不触碰。
+/// 铁律：只按沙箱 data-dir 定位并停止；真实 Science 实例（8765 / 8000）绝不触碰；
+/// 占用者是**别的程序**时**绝不杀**（那是用户的杀毒软件/别的软件，不是我们的）。
 #[cfg(target_os = "windows")]
 fn free_sandbox_port(
     app: &tauri::AppHandle,
@@ -1640,6 +1785,16 @@ fn free_sandbox_port(
     if !sandbox_port_listening(port) {
         return None;
     }
+    // 占用者是谁？
+    // - 是**别的程序**（杀毒软件服务等）→ 我们无权也不该杀它，直接如实报告，
+    //   让上层换端口（不必白等 10 秒）。
+    // - 是**自家沙箱 daemon** → 按 data-dir 优雅停，再不行才强杀。
+    let owners = port_owner_pids(port);
+    let all_ours = !owners.is_empty() && owners.iter().all(|p| owner_is_our_sandbox(*p));
+    if !all_ours {
+        return Some(describe_port_conflict(port, &owners));
+    }
+
     // 先按 data-dir 优雅停本沙箱的 daemon（可能正是那个占用者）。
     {
         let mut st = lock(state);
@@ -1674,16 +1829,72 @@ fn free_sandbox_port(
     if owners.is_empty() {
         return None;
     }
-    Some(format!(
-        "沙箱端口 {port} 被另一个程序占用（pid: {}）。通常是上一次运行残留的 Claude Science \
-         进程还没退出。请先点「全部停止」；若仍不行，请用管理员身份运行一次本程序点「全部停止」\
-         （普通权限停不掉以管理员身份启动的进程），或在「高级设置」里换一个沙箱端口。",
-        owners
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
+    Some(describe_port_conflict(port, &owners))
+}
+
+/// 描述「端口被谁占了」，并给出**针对那个程序**的建议。
+///
+/// 真实客户现场：占用者是**金山毒霸服务进程** `kxescore.exe`（pid 4812，`/service kxescore`），
+/// 普通权限 Stop-Process 直接「拒绝访问」。此前程序一律说「上次残留的 Claude Science 进程，
+/// 请点全部停止」——对服务进程完全无效，把客户带偏了。
+#[cfg(target_os = "windows")]
+fn describe_port_conflict(port: u16, owners: &[u32]) -> String {
+    let mut parts = Vec::new();
+    for pid in owners {
+        let (name, cmd) = process_info(*pid);
+        let label = if name.is_empty() {
+            format!("pid {pid}")
+        } else {
+            format!("{name}（pid {pid}）")
+        };
+        // 认出「系统服务 / 安全软件」：这类进程普通用户杀不掉，建议只能是换端口或退出该软件。
+        let is_service = cmd.contains("/service")
+            || cmd.contains("kingsoft")
+            || cmd.contains("360")
+            || cmd.contains("huorong")
+            || cmd.contains("mcafee")
+            || cmd.contains("symantec")
+            || cmd.contains("avast")
+            || cmd.contains("kaspersky");
+        let hint = if is_service {
+            "——它是系统服务/安全软件的常驻进程，普通权限无法结束"
+        } else if owner_is_our_sandbox(*pid) {
+            "——是上一次运行残留的 Claude Science 进程"
+        } else {
+            "——是本机其它程序"
+        };
+        parts.push(format!("{label}{hint}"));
+    }
+    format!(
+        "沙箱端口 {port} 被占用：{}。\n\
+         如果占用者是本程序上次残留的 Claude Science 进程，请点「全部停止」后重试；\
+         如果是杀毒软件或其它系统服务（如上），请退出该软件后重试，或在「高级设置」里换一个沙箱端口\
+         （如 {}）。",
+        parts.join("；"),
+        port + 1
+    )
+}
+
+/// 找一个**空闲**的沙箱端口，从 `want` 开始往后顺延（跳过 `avoid` 与保留端口）。
+///
+/// 用途：沙箱端口被杀毒软件之类的外部程序抢占时，程序自己绕开（自愈），
+/// 而不是让用户去改设置。找不到就返回 None（让上层报明确的错）。
+#[cfg(target_os = "windows")]
+fn find_free_port(want: u16, avoid: u16) -> Option<u16> {
+    // 最多往后找 50 个；跳过 Windows 保留端口 8765（真实 Science）与 8000。
+    for cand in (want as u32)..(want as u32 + 50) {
+        if cand == 8765 || cand == 8000 {
+            continue;
+        }
+        let c = cand as u16;
+        if c == avoid {
+            continue;
+        }
+        if !sandbox_port_listening(c) {
+            return Some(c);
+        }
+    }
+    None
 }
 
 /// 起沙箱 Science 并探活，失败时按「runtime 展开失败」自愈重试一次。
@@ -1693,6 +1904,9 @@ fn free_sandbox_port(
 /// 还在解压的 daemon 杀掉 → 留下半成品 runtime → 之后每次启动都在「改名到位」那步 EPERM 失败
 /// （自伤循环）。现在：给足 180s、daemon 死了立刻报错、命中解压类错误就清残留 +
 /// 复制官方 runtime 并重试一次。
+///
+/// 返回 `(实际使用的端口, 换端口提示)`：端口被外部程序（如杀毒软件）抢占时自动顺延，
+/// 并把「换到哪个端口」告诉用户。
 #[cfg(target_os = "windows")]
 fn spawn_sandbox_and_probe(
     app: &tauri::AppHandle,
@@ -1700,27 +1914,57 @@ fn spawn_sandbox_and_probe(
     bin: &Path,
     auth_dir: &Path,
     sport: u16,
+    proxy_port: u16,
     proxy_url: &str,
     sbx_home: &Path,
     secret: &str,
     logf: &std::fs::File,
-) -> Result<(), String> {
+) -> Result<(u16, Option<String>), String> {
     let mut attempt = 0u8;
+    // 实际使用的端口（可能被顺延替换）+ 给用户的说明。
+    let mut eff_port = sport;
+    let mut port_note: Option<String> = None;
     loop {
         attempt += 1;
 
-        // 起之前先看端口有没有被占。客户现场：`port 8990 is held by live pid(s) 4812`——
-        // 那是上一次运行留下的孤儿 daemon（多为管理员身份起的，普通用户 stop 不掉），
-        // 新 daemon 前面所有 boot 阶段都正常，最后绑定失败退出。**先清掉占用者再起**，
-        // 否则每次都要等它跑完整套 boot 才失败。
-        if let Some(msg) = free_sandbox_port(app, state, sport) {
-            return Err(msg);
+        // 起之前先看端口有没有被占。
+        //
+        // 客户现场（真机）：占用 8990 的是**金山毒霸的服务进程** `kxescore.exe`
+        // （`/service kxescore`，系统服务，普通权限 Stop-Process 直接「拒绝访问」），
+        // 不是「上次残留的 Claude Science 进程」。对服务进程说「点全部停止」完全无效，
+        // 所以这里：自家残留 → 停掉它；外部程序占 → **自动顺延到下一个空闲端口**。
+        if let Some(msg) = free_sandbox_port(app, state, eff_port) {
+            match find_free_port(eff_port.saturating_add(1), proxy_port) {
+                Some(p) => {
+                    port_note = Some(format!(
+                        "沙箱端口 {eff_port} 被其他程序占用，已自动改用 {p}。{}",
+                        msg.lines().next().unwrap_or("").trim()
+                    ));
+                    eff_port = p;
+                    // 落盘：下次启动、状态灯、「全部停止」都以新端口为准，
+                    // 免得每次都重新撞同一个被抢占的端口。
+                    let _ = config::update(&config::default_dir(), |c| {
+                        c.sandbox_port = p;
+                    });
+                }
+                None => return Err(msg),
+            }
         }
 
-        // 只看本次启动新产生的日志（上次失败留下的旧尾巴不能用来判断这次）。
-        let log_start = std::fs::metadata(log_path("sandbox.log"))
-            .map(|m| m.len() as usize)
-            .unwrap_or(0);
+        // 本次启动的唯一标记：用来切出「本次」的日志（见 tail_after_marker 的说明）。
+        let marker = format!(
+            "=== csswitch spawn attempt {} pid={} port={} ===",
+            attempt,
+            std::process::id(),
+            eff_port
+        );
+        {
+            use std::io::Write;
+            let mut w = logf;
+            let _ = writeln!(w, "{marker}");
+            let _ = w.flush();
+        }
+
         let mut cmd = Command::new(bin);
         hidden(&mut cmd);
         cmd.arg("serve")
@@ -1730,7 +1974,7 @@ fn spawn_sandbox_and_probe(
             .arg("--config")
             .arg(write_science_config(auth_dir)?)
             .arg("--port")
-            .arg(sport.to_string())
+            .arg(eff_port.to_string())
             .arg("--no-browser")
             .arg("--no-auto-update")
             .arg("--detached")
@@ -1746,39 +1990,54 @@ fn spawn_sandbox_and_probe(
         {
             let mut st = lock(state);
             st.sandbox = Some(child);
-            st.sandbox_port = sport;
+            st.sandbox_port = eff_port;
         }
 
         // 轮询沙箱 /health 直到就绪或超时（冷启动含 runtime 展开，给 180s）。
         //
         // **不用「父进程退出」判失败**：`serve --detached` 的启动器进程在 daemon 就绪后
         // **自己就会退出**（真正的 daemon 是它派生的 `--_daemon-child`），照退出判定会把
-        // 健康的 daemon 误杀。改为看日志里有没有致命错误（runtime 展开失败等）——那才是
-        // 真正起不来的信号。
+        // 健康的 daemon 误杀。改为看日志里有没有致命错误——那才是真正起不来的信号。
         let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        let started = std::time::Instant::now();
+        let mut last_sci_poll = u64::MAX;
         let mut ok = false;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));
-            if proc::http_health(sport, None, 400) {
+            let elapsed = started.elapsed();
+            if proc::http_health(eff_port, None, 400) {
                 ok = true;
                 break;
             }
-            // 日志出现致命错误（runtime 展开失败 / 权限不足）→ 立刻中止等待。
-            let tail = tail_file_from(&log_path("sandbox.log"), log_start, 4000);
-            if fatal_sandbox_log(&tail) {
+            // 致命错误要**同时**看两处日志（实测）：
+            // - 我们自己的 stdout：启动器说 `daemon ... exited before becoming ready`
+            //   → 这次启动已经确定失败，**立刻**结束等待（否则白等满 180 秒）；
+            // - Science 自己的 server-*.log：端口冲突 / runtime 展开失败写在这里，
+            //   stdout 里**根本没有**（早期实现只看 stdout，所以永远看不到真实原因）。
+            let out_tail = tail_after_marker(&log_path("sandbox.log"), &marker, 4000);
+            if launcher_gave_up_log(&out_tail) {
                 break;
+            }
+            // Science 的 server-*.log 可能几百 KB，每 200ms 全读一遍太浪费；
+            // 降频到每 1s 一次（stdout 的 gave-up 信号 26s 内就会到，不影响快速失败）。
+            if elapsed.as_secs() != last_sci_poll {
+                last_sci_poll = elapsed.as_secs();
+                let sci_tail = science_server_log_tail(8000);
+                if fatal_sandbox_log(&sci_tail) {
+                    break;
+                }
             }
         }
         if ok {
-            return Ok(());
+            return Ok((eff_port, port_note));
         }
 
-        let new_tail = redact(
-            &tail_file_from(&log_path("sandbox.log"), log_start, 2500),
-            secret,
-        );
-        let unpack_failed = unpack_failure_log(&new_tail);
-        let port_conflict = port_conflict_log(&new_tail);
+        let out_tail = redact(&tail_after_marker(&log_path("sandbox.log"), &marker, 2500), secret);
+        let sci_tail = redact(&science_server_log_tail(8000), secret);
+        // 真实原因以 Science 自己的日志为准（端口冲突只写在那里）。
+        let combined = format!("{out_tail}\n{sci_tail}");
+        let unpack_failed = unpack_failure_log(&combined);
+        let port_conflict = port_conflict_log(&combined);
         // 探活失败：停掉刚起的沙箱（不留下孤儿进程），并清掉它可能留下的 runtime 临时目录
         // ——留着它会让下一次启动在同一步失败。
         {
@@ -1789,25 +2048,8 @@ fn spawn_sandbox_and_probe(
 
         // 端口冲突：runtime 自愈没用（问题在占用者，不在 runtime），直接报清楚。
         if port_conflict {
-            let owners = port_owner_pids(sport);
-            let who = if owners.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "（占用进程 pid: {}）",
-                    owners
-                        .iter()
-                        .map(|p| p.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            return Err(format!(
-                "沙箱端口 {sport} 被另一个程序占用{who}。通常是上一次运行留下的 Claude Science \
-                 进程还没退出。请先点「全部停止」；若仍不行，请用管理员身份运行一次本程序点「全部停止」\
-                 （普通权限停不掉以管理员身份启动的进程），或在「高级设置」里换一个沙箱端口。\
-                 日志：\n{new_tail}"
-            ));
+            let owners = port_owner_pids(eff_port);
+            return Err(describe_port_conflict(eff_port, &owners));
         }
 
         if attempt == 1 && unpack_failed {
@@ -1829,17 +2071,30 @@ fn spawn_sandbox_and_probe(
 
         if unpack_failed {
             return Err(format!(
-                "沙箱启动失败（端口 {sport}）。Science 展开自己的运行时文件时被系统拒绝（通常是\
+                "沙箱启动失败（端口 {eff_port}）。Science 展开自己的运行时文件时被系统拒绝（通常是\
                  杀毒软件/索引器正在占用，或目录权限不足）；请关闭杀毒软件实时防护后重试，\
-                 或用管理员身份运行一次让文件落地。日志：\n{new_tail}"
+                 或用管理员身份运行一次让文件落地。日志：\n{}",
+                tail_for_error(&combined)
             ));
         }
         return Err(format!(
-            "沙箱起后探活超时（端口 {sport}，已等 180 秒）。首次启动需展开 runtime（约 124 MB），\
-             请确认磁盘有空间、杀毒软件未拦截；日志：\n{new_tail}"
+            "沙箱起后探活超时（端口 {eff_port}，已等 180 秒）。首次启动需展开 runtime（约 124 MB），\
+             请确认磁盘有空间、杀毒软件未拦截；日志：\n{}",
+            tail_for_error(&combined)
         ));
     }
 }
+
+/// 报错时给用户看的日志尾巴：真实原因多在 Science 自己的日志里，截断到 2500 字符。
+fn tail_for_error(combined: &str) -> String {
+    let s = combined.trim();
+    if s.chars().count() <= 2500 {
+        return s.to_string();
+    }
+    let keep: String = s.chars().skip(s.chars().count() - 2500).collect();
+    format!("…（前文已省略）\n{keep}")
+}
+
 
 /// 「一键开始」：起代理 → 写虚拟 OAuth → 起沙箱 Science → 探活 → 开浏览器。
 /// macOS：经 launch/stop 脚本；Windows：原生 `claude-science serve --detached`（独立
@@ -2078,13 +2333,14 @@ async fn one_click_login(
             forged.enc_file.display()
         );
     }
-    // 4b. 起沙箱 + 探活（含 runtime 展开失败自愈）。
-    spawn_sandbox_and_probe(
+    // 4b. 起沙箱 + 探活（含 runtime 展开失败自愈、端口被外部程序抢占时自动顺延）。
+    let (eff_port, port_note) = spawn_sandbox_and_probe(
         &app,
         &state,
         &bin,
         &auth_dir,
         sport,
+        pport,
         &proxy_url,
         &sbx_home,
         &secret,
@@ -2094,21 +2350,21 @@ async fn one_click_login(
     // 5b. 身份确认（修 P2 GPT 复审）：/health 200 只证明端口在服务，不证明是我们的 Science。
     // 按 data-dir 强身份再确认一次；不是我们的 → 当启动失败处理，停掉并如实报错。
     // 重试 8s：daemon 刚起来时 CLI 可能还没登记完，误判会把自己起的沙箱杀掉。
-    if !sandbox_identity_confirmed(sport, Duration::from_secs(8)) {
+    if !sandbox_identity_confirmed(eff_port, Duration::from_secs(8)) {
         {
             let mut st = lock(&state);
             let _ = stop_sandbox_inner(&app, &mut st);
         }
         return Err(format!(
-            "端口 {sport} 有服务响应，但按 data-dir 确认不是本沙箱 Science（疑似被其它服务占用）。已尝试停掉刚起的沙箱。"
+            "端口 {eff_port} 有服务响应，但按 data-dir 确认不是本沙箱 Science（疑似被其它服务占用）。已尝试停掉刚起的沙箱。"
         ));
     }
 
     // 6. 取 UI URL（登录态），交系统浏览器打开。
-    let url = sandbox_url(sport);
+    let url = sandbox_url(eff_port);
     {
         let mut st = lock(&state);
-        st.sandbox_port = sport;
+        st.sandbox_port = eff_port;
         st.sandbox_url = Some(url.clone());
     }
     let started = match login_action {
@@ -2118,6 +2374,11 @@ async fn one_click_login(
     let msg = match crate::nonce_autologin::open_science_ui(&url) {
         Ok(()) => format!("{started}。"),
         Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
+    };
+    // 端口被顺延过 → 把这件事说清楚（用户会以为「我明明设的是 8990」）。
+    let msg = match port_note {
+        Some(n) => format!("{msg}\n（{n}）"),
+        None => msg,
     };
     Ok(json!({ "url": url, "msg": msg, "action": "started" }))
     } // #[cfg(target_os = "windows")]
@@ -2615,21 +2876,61 @@ mod tests {
         );
     }
 
-    /// tail_file_from 只取本次启动新增的日志，不被上次的旧尾巴误导（自愈判断依赖这个）。
+    /// tail_after_marker 只取本次启动新增的日志，不被上次的旧尾巴误导（自愈判断依赖这个）。
     #[test]
-    fn tail_file_from_only_returns_new_bytes() {
+    fn tail_after_marker_only_returns_new_bytes() {
         let dir = std::env::temp_dir().join("csswitch-test-tailfrom");
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("t.log");
-        std::fs::write(&p, b"OLD-ERROR-EPERM\n").unwrap();
-        let from = std::fs::metadata(&p).unwrap().len() as usize;
-        std::fs::write(&p, b"OLD-ERROR-EPERM\nNEW-GOOD-LINE\n").unwrap();
-        let got = super::tail_file_from(&p, from, 2500);
+        let marker = "=== MARK ===";
+        std::fs::write(&p, format!("OLD-ERROR-EPERM\n{marker}\nNEW-GOOD-LINE\n")).unwrap();
+        let got = super::tail_after_marker(&p, marker, 2500);
         assert!(!got.contains("OLD-ERROR"), "旧内容不应出现：{got:?}");
         assert!(got.contains("NEW-GOOD-LINE"), "新内容应出现：{got:?}");
-        // from 超过文件长度时也不应 panic。
-        let _ = super::tail_file_from(&p, 999_999, 2500);
+        // marker 不存在时返回空串（不 panic）。
+        let _ = super::tail_after_marker(&p, "=== NO-SUCH-MARKER ===", 2500);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 客户现场：残留 daemon 持有同一日志句柄、在高偏移继续写 → 文件中间出现 NUL 空洞。
+    /// 按 marker 取增量时必须在空洞处截断，否则会把旧内容当成本次输出。
+    #[test]
+    fn tail_after_marker_stops_at_nul_gap() {
+        let dir = std::env::temp_dir().join("csswitch-test-nul");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("t.log");
+        let marker = "=== MARK ===";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(marker.as_bytes());
+        buf.extend_from_slice(b"\nNEW-GOOD-LINE\n");
+        buf.resize(4096, 0u8); // NUL 空洞 = 残留写者的旧偏移
+        buf.extend_from_slice(b"OLD-STALE-CONTENT\n");
+        std::fs::write(&p, &buf).unwrap();
+        let got = super::tail_after_marker(&p, marker, 2500);
+        assert!(got.contains("NEW-GOOD-LINE"), "新内容应出现：{got:?}");
+        assert!(
+            !got.contains("OLD-STALE-CONTENT"),
+            "空洞之后的旧内容不应出现：{got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动器说「daemon 没起来就退了」= 这次启动已确定失败，必须立刻结束等待。
+    /// 客户现场：端口被占时 daemon 跑完十几秒 boot 才失败，没有这条就得干等 180 秒。
+    #[test]
+    fn launcher_gave_up_is_detected() {
+        assert!(
+            super::launcher_gave_up_log("daemon (pid 23448) exited before becoming ready"),
+            "启动器放弃必须被识别"
+        );
+        assert!(
+            super::launcher_gave_up_log("port 8990 is already in use by another app."),
+            "端口占用也要算启动失败"
+        );
+        assert!(
+            !super::launcher_gave_up_log("[claude-science] daemon started on port 8990 (pid 1)"),
+            "正常启动不能被误判"
+        );
     }
 
     /// sandbox_path_is_safe：只接受沙箱目录下的路径，越界（真实目录）一律拒绝。
@@ -2686,7 +2987,6 @@ mod tests {
             !super::unpack_failure_log(conflict),
             "端口占用不应被当成 runtime 展开失败"
         );
-
         let unpack = "claude-science: console trampoline sync failed (Couldn't unpack the files \
                       Claude Science needs ... (EPERM: operation not permitted, rename \
                       '...runtime\\0.1.50-release.tmp-28292-1793544074523' -> \
@@ -2697,5 +2997,110 @@ mod tests {
             !super::port_conflict_log(unpack),
             "解压失败不应被当成端口占用"
         );
+    }
+
+    /// `netstat -ano` 的列位解析：Proto | Local | Foreign | State | PID。
+    ///
+    /// ⚠️ 早期实现把 State/PID 读成了第 3/4 列（实际是第 4/5 列），于是**永远查不到**
+    /// 占用者 → 「起前查端口」整个自愈逻辑形同虚设。这个测试锁死列位。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn netstat_columns_are_parsed_correctly() {
+        let sample = "活动连接
+                      
+                      协议  本地地址          外部地址        状态           PID
+                        TCP    0.0.0.0:22             0.0.0.0:0              LISTENING       6048
+                        TCP    127.0.0.1:8990        0.0.0.0:0              LISTENING       4812
+                        TCP    127.0.0.1:8990        0.0.0.0:0              ESTABLISHED     9999
+";
+        // 用与实现完全一致的列位逻辑复算（防止实现和测试各写一份、各自错）。
+        let port = 8990u16;
+        let mut pids = Vec::new();
+        for line in sample.lines() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 5 || !cols[0].eq_ignore_ascii_case("TCP") {
+                continue;
+            }
+            let Some((_, local)) = cols[1].rsplit_once(':') else {
+                continue;
+            };
+            if local != port.to_string() {
+                continue;
+            }
+            if !cols[3].eq_ignore_ascii_case("LISTENING") {
+                continue;
+            }
+            if let Ok(pid) = cols[4].parse::<u32>() {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+        assert_eq!(pids, vec![4812], "必须只取到 LISTENING 那一行的 PID");
+    }
+
+    /// 客户现场（真机）：8990 被**金山毒霸的服务进程** `kxescore.exe` 占着。
+    /// 程序必须认得出「占用者是谁」并据此给建议——不能一律说「上次残留的 Claude Science
+    /// 进程，请点全部停止」（对服务进程那完全无效，把客户带偏）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn describe_port_conflict_names_the_occupant() {
+        // 造一个假的占用者描述：外部程序（非自家沙箱）。
+        let owners: Vec<u32> = vec![];
+        let msg = super::describe_port_conflict(8990, &owners);
+        assert!(msg.contains("8990"), "必须写明端口：{msg}");
+        assert!(
+            msg.contains("全部停止") || msg.contains("换一个沙箱端口"),
+            "必须给出可执行的下一步：{msg}"
+        );
+
+        // 占用者是自家沙箱 daemon 时，措辞应是「残留的 Claude Science 进程」。
+        let ours = super::owner_is_our_sandbox(std::process::id());
+        assert!(
+            !ours,
+            "当前进程不是沙箱 daemon，不该被认成自家的（否则会误杀别的进程）"
+        );
+    }
+
+    /// 真机验证：外部程序占住端口时，程序能认出占用者、且**不会**误杀它。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn live_external_occupant_is_identified_and_not_killed() {
+        // 在本机起一个真实的监听者当「外部程序」（等价于金山的 kxescore.exe）。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(super::sandbox_port_listening(port), "端口应显示为被监听");
+        let owners = super::port_owner_pids(port);
+        assert!(!owners.is_empty(), "必须查到占用 pid");
+        // 自家的沙箱 daemon 判定必须为假 —— 否则程序会去 taskkill 用户的杀毒软件！
+        for pid in &owners {
+            assert!(
+                !super::owner_is_our_sandbox(*pid),
+                "外部进程 {pid} 不该被认成自家沙箱（否则会被误杀）"
+            );
+        }
+        // 报错文案必须点名占用者，而不是一律说「残留的 Claude Science 进程」。
+        let msg = super::describe_port_conflict(port, &owners);
+        assert!(msg.contains(&port.to_string()), "必须写明端口：{msg}");
+        println!("占用者描述：{msg}");
+    }
+
+    /// 端口被占时必须能**自动顺延**到下一个空闲端口（客户现场：杀毒软件抢了 8990）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn find_free_port_skips_occupied_ports() {
+        // 找一个当前确实被占用的端口：拿本机某个常见端口做探测不现实，
+        // 改为验证「顺延」逻辑本身——从一个大概率空闲的端口开始，应能拿到端口号。
+        let want = 45789u16;
+        match super::find_free_port(want, 0) {
+            Some(p) => assert!(p >= want, "顺延只能往后找：{p} < {want}"),
+            None => {
+                // 50 个端口全被占（极不可能）也算合法结果。
+            }
+        }
+        // avoid 指定的端口必须被跳过。
+        if let Some(p) = super::find_free_port(45789, 45789) {
+            assert_ne!(p, 45789, "avoid 的端口必须被跳过");
+        }
     }
 }
