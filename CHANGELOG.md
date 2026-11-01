@@ -6,7 +6,11 @@
 
 ## [Unreleased]
 
-> 主题：**Windows 本地模式真机修复**。`52408e1` 加入 Windows 本地模式后从未在任何真机上验证过，
+（暂无）
+
+## [0.3.4] — 2026-11-01
+
+> 主题：**Windows 本地模式真机修复 + 沙箱登录自动化**。`52408e1` 加入 Windows 本地模式后从未在任何真机上验证过，
 > 本轮把它放到客户 Windows 机器上跑通，定位并修复 8 个问题。其中一条是铁律级：沙箱一直没能用上
 > 伪造登录，而是回退去读**用户真实凭证目录**。
 
@@ -39,6 +43,15 @@
 - **把自己起的沙箱误判成冒名服务**：起沙箱后先探 `/health`、立刻查身份，中间无重试；daemon 尚未登记完时
   会拿到 `running:false`，于是把自己刚起的沙箱杀掉并报「端口有服务响应但不是本沙箱 Science」。
   现强身份确认绕过缓存重试 8 秒。
+- **每次启动都要手点一次 Sign in**：Science 的登录是一次性 nonce 的中转页（厂商的 CSRF 设计，
+  非 bug），此前每次启动都要用户手动点一下。本版由 app 自动完成：进程内取回 daemon 那张中转表单
+  （自行解析 `action` 与 hidden 值，不臆测路径），起一个**只监听回环、随机口、随机路径**的一次性
+  小服务发一页自动提交表单，让**系统浏览器**自行 POST → daemon 签发 `operon_auth`（HttpOnly）→
+  直达工作区。关键前提（均经逆向 Claude Science 0.1.50 的 daemon JS 确认）：nonce 只在 POST 时消费
+  （GET 只读校验）；该路由的 origin 白名单放行任意 `127.0.0.1`/`localhost` 端口且免 CSRF token；
+  cookie 不区分端口 → helper 页必须与目标**同主机**（`localhost` 与 `127.0.0.1` 是两个不同的站，
+  跨站会让 `SameSite=Strict` 的 cookie 丢在跳转里）。
+  铁律：helper 页只含一次性 nonce 与目标路径，**不含任何密钥**；非回环目标（远程模式）自动回落旧流程。
 
 ### 新增 Added
 - **内置 Linux helper**：`desktop/src-tauri/helper-assets/` 此前只有 `.gitkeep`，而实测 v0.3.3 与 v0.8.4
@@ -47,8 +60,10 @@
 
 ### 说明 Notes
 - 本轮全部结论均来自真机验证（客户 Windows 机器 + 本机沙箱复现），非静态推断。
-- 仍未解决：nonce 首次打开时 Science 返回带「Sign in」按钮的中转页，需用户每次启动手点一次，
-  尚未处理（详见 known-issues #13）。
+- 原「每次启动需手点一次 Sign in」已在本版自动化完成（见上），known-issues #13 随之毕业。
+- 交付前置：客户需**自行安装 Claude Science**（我们不分发 Anthropic 的专有软件，本 app 只驱动它的
+  CLI）与 **Python 3 正式版**（Windows 勿用 Microsoft Store 版，执行别名会静默退出）；本地模式
+  不需要 bash / WSL / node。macOS 包为 ad-hoc 签名、未公证，首次打开需右键→「打开」。
 - 上游 `SuperJJ007/CSSwitch` 已发布至 v0.8.4，且 README 声明「公开桌面包目前只支持 macOS Apple Silicon」，
   其 Science runtime 中 `target_os = "windows"` 出现 0 次。本分支的 Windows 本地模式与 WSL 远程目标
   是上游不具备的能力，两者暂无共同祖先，合并需按「移植」而非「合并」处理（详见 known-issues #14）。

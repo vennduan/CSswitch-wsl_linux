@@ -96,6 +96,10 @@ CSSwitch 的名字和产品形态参考了 [CC Switch](https://github.com/farion
 
 开始之前，请先安装 [Claude Science](https://claude.com)，并确认系统中有 `python3`。虚拟登录已经由 Rust 原生实现，**不需要安装 Node.js**。
 
+> Windows 用户注意两点：① Python 请用 [python.org 正式版](https://www.python.org/downloads/windows/)，**不要用 Microsoft Store 版**——那个版本的执行别名会静默退出，容易被误判成「没装 Python」；② Claude Science 建议锁在 **0.1.50**（本版的自动进入机制是对该版本验证的）。
+>
+> CSSwitch **不分发** Anthropic 的软件——它只驱动 Claude Science 自带的命令行组件，不打包它。
+
 1. 从最新的 [Release](../../releases/latest) 下载对应平台的安装包：Windows x64 下载 `CSSwitch_*_x64-setup.exe`，Windows on Arm 下载 `CSSwitch_*_arm64-setup.exe`，macOS Apple Silicon 下载 `CSSwitch_*.dmg` 并把 CSSwitch 拖入「应用程序」。`csswitch-helper-linux-*` 是远程 Linux 服务器模式使用的 helper，不是桌面安装包。
 2. 打开 CSSwitch，保持顶部选择「**第三方模型**」，点「**＋ 新建**」，选择来源、粘贴自己的第三方 API Key，点「**创建**」。密钥只保存在本机 `~/.csswitch` 目录下（`config.json` 及其滚动 / 迁移备份，均为 `0600` 权限），不会离开你的电脑。
 3. 在列表里点这条配置的「**设为当前**」。CSSwitch 会先校验 Key 再启用，通不过会提示、不会切换。

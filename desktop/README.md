@@ -58,6 +58,11 @@ macOS 另需 Xcode Command Line Tools。
 | bash | **不需要** | 不需要 | 不需要 |
 | WSL2 | — | 必需 | — |
 
+> **Claude Science 需自行安装**：本项目**不分发** Anthropic 的专有软件——app 只是**驱动**它自带的
+> CLI（`claude-science serve`），不打包它。客户需自行安装官方 Claude Science（Windows 默认装到
+> `%LOCALAPPDATA%\Programs\ClaudeScience`；app 会在该目录与 PATH 上查找），并建议锁在已验证的
+> **0.1.50**（本轮的自动登录机制是对该版本 daemon 的逆向结论）。
+>
 > **Python 是硬依赖**：翻译逻辑目前仍是 `proxy/csswitch_proxy.py` 作子进程调用。官方上游已用
 > Rust 重写该层并移除此依赖，本分支暂未跟进（见 `docs/known-issues.md` #14）。
 >
@@ -65,9 +70,12 @@ macOS 另需 Xcode Command Line Tools。
 > 会静默退出，`python --version` 无输出。app 已按「`--version` 输出含 Python 才算可用」
 > 逐个验证 PATH 里的候选，故商店 stub 不会误命中，但手动排查时容易困惑。
 
-**首次进入沙箱需点一次 Sign in**：app 打开 `?nonce=...` 后，Science 返回一个带
-「Sign in」按钮的中转页，点击后才签发 `operon_auth` 并进入工作区。该 cookie 保持到
-daemon 重启，因此**每次启动点一次**（见 `docs/known-issues.md` #13）。
+**进入沙箱无需手动登录**：Science 的登录是一次性 nonce 的中转页（厂商的 CSRF 设计，非 bug）。
+自 v0.3.4 起 app 自动完成这一步：进程内取回 daemon 那张中转表单，起一个**只监听回环、随机口、
+随机路径**的一次性小服务发一页自动提交表单，由**系统浏览器**自行 POST → daemon 签发
+`operon_auth`（HttpOnly）→ 直达工作区，全程零点击。helper 页只含一次性 nonce 与目标路径，
+**不含任何密钥**；任何一步不成立都自动回落旧流程（手动点一次），绝不会因此打不开 Science。
+实现见 `src/nonce_autologin.rs`，机制证据见 `docs/known-issues.md` #13。
 
 ## 开发运行
 

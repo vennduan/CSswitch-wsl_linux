@@ -136,7 +136,9 @@ fn resolve_action(doc_path: &str, origin: &str, action: &str) -> String {
 fn parse_form(body: &str) -> Option<(String, String, String)> {
     let action = html_unescape(&attr_value(body, "action")?);
     let nonce = html_unescape(&input_value(body, "nonce")?);
-    let dest = input_value(body, "dest").map(|d| html_unescape(&d)).unwrap_or_default();
+    let dest = input_value(body, "dest")
+        .map(|d| html_unescape(&d))
+        .unwrap_or_default();
     Some((action, nonce, dest))
 }
 
@@ -246,7 +248,8 @@ fn serve_one(s: &mut TcpStream, path: &str, html: &str) {
         .map(|p| p == path)
         .unwrap_or(false);
     if !hit {
-        let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = s
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
     let body = html.as_bytes();
@@ -321,7 +324,10 @@ fn http_get(host: &str, port: u16, path: &str, timeout_ms: u64) -> Option<(u16, 
         Some((h, b)) => (h.to_string(), b.to_string()),
         None => (text.clone(), String::new()),
     };
-    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         dechunk(&body)
     } else {
         body
@@ -337,7 +343,8 @@ fn dechunk(body: &str) -> String {
         let Some((size_line, tail)) = rest.split_once("\r\n") else {
             break;
         };
-        let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or("0"), 16).unwrap_or(0);
+        let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or("0"), 16)
+            .unwrap_or(0);
         if size == 0 {
             break;
         }
@@ -379,7 +386,11 @@ mod tests {
         );
         // daemon 若挂在子路径下（action 已是绝对路径），直接用。
         assert_eq!(
-            resolve_action("/base/setup", "http://127.0.0.1:8990", "/base/api/auth/nonce"),
+            resolve_action(
+                "/base/setup",
+                "http://127.0.0.1:8990",
+                "/base/api/auth/nonce"
+            ),
             "http://127.0.0.1:8990/base/api/auth/nonce"
         );
     }
@@ -387,9 +398,15 @@ mod tests {
     #[test]
     fn splits_and_gates_loopback() {
         let (h, p, path) = split_url("http://127.0.0.1:8990/setup?nonce=abc").unwrap();
-        assert_eq!((h.as_str(), p, path.as_str()), ("127.0.0.1", 8990, "/setup?nonce=abc"));
+        assert_eq!(
+            (h.as_str(), p, path.as_str()),
+            ("127.0.0.1", 8990, "/setup?nonce=abc")
+        );
         assert!(is_loopback(&h));
-        assert!(split_url("https://127.0.0.1:8990/").is_none(), "只处理 http");
+        assert!(
+            split_url("https://127.0.0.1:8990/").is_none(),
+            "只处理 http"
+        );
         assert!(!is_loopback("192.168.1.7"));
     }
 

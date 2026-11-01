@@ -167,19 +167,24 @@
 - **三大根因归类**（沿用 2026-07-03 分诊，`findings/2026-07-03-user-reported-bugs-triage.md`）：① 架构边界（claude.ai 服务端功能被 401 隔离）=#3/#5/#8/#9；② 模型端（DeepSeek 透传把 tool_use 吐成文本卡死）=#2/#6 最严重；③ 疑可修代理 bug=#4（输出一晃而过）/#12（自定义校验）/#1（梯子）。
 - **下一步优先级（2026-07-04 更新）**：~~先修 #9 模型选择器~~ **✅ #9 已实现 + 真机验证 + merge 进 main**。剩：① 补 README/About → 走 v0.3.2 发版（版本 bump/tag/dmg/Release）；② #12 校验部分（自定义 scratch 误判）待复现；③ Kimi/MiniMax 已就绪随 v0.3.2 一起发。
 
-## 13. 每次「一键开始」需手动点一次 Sign in（2026-10-12 新记录）
+## 13. ✅ 每次「一键开始」需手动点一次 Sign in（已随 v0.3.4 发布，已毕业）
 
-> **状态：已知悉，不修（2026-10-12 用户决定）。** 每次多点一次可接受。
-> 该行为已在 `desktop/README.md`「前置依赖」段写明，用户预期内。
-> 以下机制说明保留，供日后若要改时参考。
+> **状态：已随 v0.3.4（2026-11-01）发布并毕业到 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.3.4]`。**
+> 该问题 2026-10-12 记录时「已知悉不修」，2026-11-01 改为自动化：app 自行取回 daemon 的中转表单，
+> 起一个只监听回环的一次性小服务发自动提交页，由**系统浏览器**完成 POST，登录全程零点击。
+> 机制说明保留，供日后若要改时参考。
 
 - **现象**：app 打开 `?nonce=...` 后，浏览器显示一个只有 "Sign in" 按钮的中转页，
   用户必须手点一次才进入工作区；此后 `operon_auth` cookie 保持到 daemon 重启，故**每次启动点一次**。
 - **机制**（逆向 Science 0.1.50 确认）：nonce 的 GET 处理在检测到有效 bearer 时直接放行应用，
   否则返回一个表单页，POST `/api/auth/nonce` 才会签发 `operon_auth`。这是厂商为避免 GET 建立会话
   做的 CSRF 设计，非 bug。
-- **可选处置**：① 最小改动——在面板成功提示里写明「首次打开请点击页面上的 Sign in」；
-  ② 彻底——尝试免掉这一次点击（跨源 POST 会被 `SameSite=Strict` 拦，需另找路径）。
+- **实际处置（v0.3.4 已做）**：绕过点击的方式不是硬闯 `SameSite=Strict`，而是**让 helper 页与目标同主机**——
+  `localhost` 与 `127.0.0.1` 在 cookie 语义里是两个不同的站，helper 页放在同一主机后，POST 与随后的
+  meta-refresh 跳转都属同站，`SameSite=Strict` 的 `operon_auth` 照常带上。
+  另两条前提（逆向 Claude Science 0.1.50 daemon JS 确认）：nonce 只在 POST 时消费（GET 只读校验），
+  故可跳过 GET 直接 POST；`/api/auth/nonce` 的 origin 白名单放行任意 `127.0.0.1`/`localhost` 端口且免 CSRF token。
+  实现见 `desktop/src-tauri/src/nonce_autologin.rs`。
 
 ## 14. 本分支与上游 v0.8.4 无共同祖先，合并需按「移植」处理（2026-10-12 新记录）
 
