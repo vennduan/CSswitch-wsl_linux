@@ -225,9 +225,15 @@
      runtime 目录 → **之后每次启动都在同一步 rename 失败**（自伤循环，客户表现为「越试越坏」）；
   3. **端口被上一次运行的孤儿 daemon 占着**（v0.3.5 现场日志实锤）：
      `port 8990 is held by live pid(s) 4812 — not a stale listener, not reclaiming`
-     → `port 8990 is already in use by another app.`。那个 pid 是客户用**管理员身份**跑过一次
-     留下的 daemon（普通权限停不掉）。新 daemon 的**所有 boot 阶段都正常**（MCP 连接器全连上），
-     最后一步绑定端口失败退出——旧代码不认这条日志，于是白等满探活窗口 → 表现为「一直停在启动中」。
+     → `port 8990 is already in use by another app.`。新 daemon 的**所有 boot 阶段都正常**
+     （MCP 连接器全连上），最后一步绑定端口失败退出——旧代码不认这条日志，于是白等满探活窗口
+     → 表现为「一直停在启动中」。
+     > **⚠️ 2026-11-02 修正**：当时把 pid 4812 判成「客户用管理员身份跑过一次留下的 daemon」
+     > 是**错的**。客户 PowerShell 实证：`Get-CimInstance Win32_Process -Filter "ProcessId=4812"`
+     > → `"c:\program files (x86)\kingsoft\kingsoft antivirus\kxescore.exe" /service kxescore`，
+     > 且 `Stop-Process -Id 4812 -Force` → **拒绝访问**（系统服务，普通权限杀不掉）。
+     > 即占用者是**金山毒霸的常驻服务**，与本程序无关，也点不了「全部停止」。
+     > 详见 [16](#16-✅-沙箱端口被系统服务抢占的真因自愈已随-v036-发布已毕业)。
 - **处置（v0.3.5 已做）**：
   - 探活窗口 180 秒；失败先看日志判定是否致命错误再决定杀不杀；
   - **认端口占用日志为致命错误** → 立即中止等待并报出占用 pid（不再白等 3 分钟）；
@@ -239,3 +245,57 @@
 - **关键坑（易再犯）**：`serve --detached` 的**启动器进程在 daemon 就绪后自己会退出**
   （真正的 daemon 是它派生的 `--_daemon-child`）。**不可**用「父进程退出」判断 daemon 死亡——
   那会把健康 daemon 误杀。判定必须看 `/health` 或日志内容。
+
+## 16. ✅ 沙箱端口被系统服务抢占的真因自愈（已随 v0.3.6 发布，已毕业）
+
+> **状态：已随 v0.3.6（2026-11-02）发布并毕业到 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.3.6]`。**
+> 本条记录真因判定链与三条易再犯的坑。
+
+- **现象**（客户真机，v0.3.5，Windows 中文用户名「梓昀」）：
+  「一键开始」→ 一直停在启动中 → 约 3 分钟后报「沙箱起后探活超时（端口 8990，已等 180 秒）」。
+  客户 `sandbox.log` 里九次 daemon 启动，**每一次**都收尾于
+  `port 8990 is held by live pid(s) 4812 — not a stale listener, not reclaiming`。
+- **真因（客户 PowerShell 实证，v0.3.5 判错了）**：
+  ```
+  Get-NetTCPConnection -LocalPort 8990 -State Listen | Select-Object OwningProcess  → 4812
+  Get-CimInstance Win32_Process -Filter "ProcessId=4812" | Select-Object CommandLine
+    → "c:\program files (x86)\kingsoft\kingsoft antivirus\kxescore.exe" /service kxescore
+  Stop-Process -Id 4812 -Force  → 拒绝访问（系统服务，普通权限停不掉）
+  ```
+  占用者是**金山毒霸的常驻服务进程**，不是本程序的残留 daemon。
+  → 手动解法：**改沙箱端口**（高级设置里 8990 → 8991 之类空闲口），代理端口 18991 不动。
+- **三条易再犯的坑**（都已踩过）：
+  1. **日志源搞错**：端口冲突原文写在 Science 自己的
+     `~/.csswitch/sandbox/home/.claude-science/logs/server-*.log`，
+     **我们的 stdout 里根本没有**。只扫 stdout → 永远只能报「探活超时」这种无信息量的错。
+  2. **`netstat -ano` 列序**：真实是 `Proto | Local Address | Foreign Address | State | PID`
+     ——State 在**下标 3**、PID 在**下标 4**。查错列会让「起前查端口」自愈路径
+     **一次都走不到**（返回空列表 → 当成没占用）。已用测试锁死列序。
+  3. **`serve --detached` 的进程拓扑**：启动器进程在 daemon 就绪后**自己会退出**
+     （真 daemon 是它派生的 `--_daemon-child`）。**不可**用「父进程退出」判断 daemon 死亡。
+     失败信号只能来自：① `/health` 探活；② 启动器 stdout 的
+     `daemon … exited before becoming ready`（实测端口被占时 **26.3 秒**出现）；
+     ③ Science `server-*.log` 里的致命行。
+- **v0.3.6 处置**：
+  - 报错**点名占用者**（CIM 查 NAME/CMDLINE），并按类型分诊：系统服务/安全软件 →
+    「普通权限停不掉，请退出该软件或换端口」；自家残留 → 「点全部停止」；其它程序 → 如实说明。
+  - 端口被**外部**程序占时**自动顺延**到下一个空闲口（跳过 8765/8000/代理口），写回配置
+    并告知用户新端口，不必手工改。
+  - 只有确认占用者是**自家沙箱进程**（命令行含沙箱 data-dir）才 taskkill；
+    绝不误杀外部程序（有活体测试锁死这条）。
+  - 启动器给弃信号即**立刻**中止等待（秒级失败，不再干等 180 秒）。
+  - 日志增量改用**标记法**（`tail_after_marker`）：残留写者持有同一文件句柄会在高偏移写入、
+    中间留 NUL 空洞，按字节偏移增量读会读到乱码。
+  - PowerShell 侧强制 UTF-8 输出，兼容中文用户名/中文路径。
+
+## 17. Windows 换盘重装报错（信息不全，待客户补图）
+
+- **现象**（用户 2026-11-02 转述）：「我是安装到 D 盘的，我重新选择 C 盘安装出现了报错」，
+  并怀疑是「用户 Windows 是中文用户名」导致。**用户已叫停本机复现**（本机无法复现客户机环境）。
+- **现状**：**没有拿到任何报错文本/截图**，无法定位。本机 D:→C: 重装的复现尝试已按用户要求停止。
+- **待收集**：① 报错原文或截图；② 是安装器（NSIS）报错还是装完运行报错；
+  ③ 客户是否真用中文用户名（已知是「梓昀」）；④ 是否装了杀毒软件拦截写入。
+- **注意**：中文用户名本身**不是**已知风险点——当前代码里 Windows 路径处理已做 UTF-8 强制输出
+  （见 [16](#16-✅-沙箱端口被系统服务抢占的真因自愈已随-v036-发布已毕业)），
+  且沙箱路径固定在 `~/.csswitch/` 下，不随安装盘符变化。真正的变量更可能是
+  「旧盘残留 + 新盘权限/杀软拦截」。**待证据，不猜。**
