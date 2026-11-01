@@ -8,6 +8,8 @@ on:
       - 'feat/**'
   pull_request:
     branches: ['main']
+  # 手动触发：fork 的 push 事件有时不建 run（Actions 里一条都没有），留个手动入口兜底。
+  workflow_dispatch:
 
 jobs:
   # ---- Windows 桌面 app ----
