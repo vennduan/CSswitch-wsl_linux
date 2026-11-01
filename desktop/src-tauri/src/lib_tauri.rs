@@ -95,7 +95,12 @@ fn science_cli_env(cmd: &mut Command, home: &Path) {
 /// 沙箱里伪造的 `.oauth-tokens/*.enc` 根本不被读取，`/api/auth/status` 恒为未登录。
 /// `--data-dir` **只**设 `data_dir`，不设 `auth_dir`，所以必须另给 `--config`。
 /// 真机验证：加上本配置后 `/api/auth/status` 返回 `authenticated:true`（伪造身份）。
-#[cfg(target_os = "windows")]
+///
+/// **跨平台**：Windows 必需（上面那套）；macOS 侧本来 `HOME` 已指向沙箱、`auth_dir` 自然落在沙箱内，
+/// 这里再钉一次是**冗余但无害**的加固。此前本函数被 `#[cfg(target_os = "windows")]` 挡住，而
+/// `sandbox_url()`（macOS + Windows 共用）会调用它 → **macOS 编译直接失败**（`E0425: cannot find
+/// function write_science_config`）。该断裂自 2026-10-12 的 Windows 修复 commit 起就存在，只因 CI
+/// 在本 fork 从未真正跑过而没被发现（2026-11-01 由 macOS CI 任务暴露）。
 fn write_science_config(auth_dir: &Path) -> Result<PathBuf, String> {
     // TOML 用正斜杠，避开反斜杠转义；路径里不含引号，Windows 合法路径不会引号。
     let p = auth_dir.to_string_lossy().replace('\\', "/");
