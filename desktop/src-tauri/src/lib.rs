@@ -22,6 +22,9 @@ mod lifecycle;
 #[cfg(all(any(target_os = "macos", target_os = "windows"), feature = "desktop"))]
 mod oauth_forge;
 mod proc;
+/// 自动登录：免掉 Science 每次启动的「Sign in」中转页点击（需 desktop feature，用到 open_in_browser）。
+#[cfg(feature = "desktop")]
+mod nonce_autologin;
 mod scratch;
 mod templates;
 // 跨平台文件权限抽象：Unix 下提供真实的 0600/0700 权限，Windows 下为 no-op。

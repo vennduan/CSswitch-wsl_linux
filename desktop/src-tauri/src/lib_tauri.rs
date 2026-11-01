@@ -1349,7 +1349,7 @@ async fn one_click_login(
                 ProxyAction::Restarted => "已用新配置重启代理，Science 沿用不变",
             };
             // P2c：捕获打开结果——open 失败不谎报「已重新打开」，改提示手动打开。
-            let msg = match open_in_browser(&url) {
+            let msg = match crate::nonce_autologin::open_science_ui(&url) {
                 Ok(()) => format!("{base}，已重新打开 Science。"),
                 Err(_) => format!("{base}，服务已就绪，请手动打开：{url}"),
             };
@@ -1461,7 +1461,7 @@ async fn one_click_login(
         _ => "沙箱已重新启动，沿用原有对话", // Reused / Repaired
     };
     // P2c：同样捕获打开结果。
-    let msg = match open_in_browser(&url) {
+    let msg = match crate::nonce_autologin::open_science_ui(&url) {
         Ok(()) => format!("{started}。"),
         Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
     };
@@ -1498,7 +1498,7 @@ async fn one_click_login(
                 ProxyAction::Restarted => "已用新配置重启代理，Science 沿用不变",
             };
             // P2c：捕获打开结果——失败不谎报「已重新打开」，改提示手动打开。
-            let msg = match open_in_browser(&url) {
+            let msg = match crate::nonce_autologin::open_science_ui(&url) {
                 Ok(()) => format!("{base}，已重新打开 Science。"),
                 Err(_) => format!("{base}，服务已就绪，请手动打开：{url}"),
             };
@@ -1613,7 +1613,7 @@ async fn one_click_login(
         oauth_forge::LoginAction::Created => "已启动",
         _ => "沙箱已重新启动，沿用原有对话", // Reused / Repaired
     };
-    let msg = match open_in_browser(&url) {
+    let msg = match crate::nonce_autologin::open_science_ui(&url) {
         Ok(()) => format!("{started}。"),
         Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
     };
@@ -1833,7 +1833,7 @@ fn open_url(state: State<'_, Mutex<AppState>>, url: Option<String>) -> Result<()
             .clone()
             .ok_or("还没有沙箱 URL，请先「一键开始」。")?,
     };
-    open_in_browser(&url)
+    crate::nonce_autologin::open_science_ui(&url)
 }
 
 /// 运行诊断脚本 `scripts/doctor.sh`。仅 macOS 本地模式有效。
