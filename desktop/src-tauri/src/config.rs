@@ -91,6 +91,11 @@ pub struct Config {
     /// 一次性迁移提示（#9 甲：回填默认模型后告知用户）。get_config 读后清空。
     #[serde(default)]
     pub pending_notice: Option<String>,
+    /// 用户手工指定的 Python 解释器路径（可空）。为空=自动探测。
+    /// 自动探测在「PATH 里没有 python / 只有商店 stub / conda 未激活」时会失败，
+    /// 让用户直接填绝对路径最省事。
+    #[serde(default)]
+    pub python_path: Option<String>,
 }
 
 impl Default for Config {
@@ -104,6 +109,7 @@ impl Default for Config {
             secret: String::new(),
             mode: default_mode(),
             pending_notice: None,
+            python_path: None,
         }
     }
 }
@@ -241,6 +247,7 @@ pub fn migrate_v1_to_v2(mut legacy: crate::config_legacy::ConfigV1) -> Config {
         secret: legacy.secret,
         mode: legacy.mode,
         pending_notice: None,
+        python_path: None,
     }
 }
 

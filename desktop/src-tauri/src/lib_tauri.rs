@@ -114,6 +114,129 @@ fn write_science_config(auth_dir: &Path) -> Result<PathBuf, String> {
     Ok(cfg_path)
 }
 
+/// 沙箱里 Science 自己展开的 kernel runtime 目录（`data-dir/runtime/`）。
+fn sandbox_runtime_dir() -> PathBuf {
+    sandbox_home().join(".claude-science").join("runtime")
+}
+
+/// 沙箱内路径逐级检查：不得有任何一级是符号链接（防预置链接把删/写指到真实目录）。
+/// 且相对路径里**不得出现 `..`**——`Path::strip_prefix` 只按字面前缀匹配，
+/// `home\..\..` 会被判成「在 home 之下」而实际指向沙箱外，必须显式拒绝。
+fn sandbox_path_is_safe(path: &Path) -> bool {
+    let root = sandbox_home();
+    if config::assert_not_symlink(&root).is_err() {
+        return false;
+    }
+    let Ok(rel) = path.strip_prefix(&root) else {
+        return false;
+    };
+    let mut cur = root.clone();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(c) => cur = cur.join(c),
+            // `..` / 根 / 前缀：一律拒绝（会逃出沙箱）。
+            _ => return false,
+        }
+        if config::assert_not_symlink(&cur).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// 清沙箱里的 runtime 残留。`full=false` 只删 `.tmp-*` 临时目录（daemon 解压中途被杀的残留）；
+/// `full=true` 连正式目录一起删（半成品目录会让 Science 下次「改名到位」直接失败）。
+///
+/// 铁律：只删 `sandbox_home()` 之下的路径；路径逐级校验不得含符号链接，否则拒绝。
+fn clean_sandbox_runtime(full: bool) -> bool {
+    let dir = sandbox_runtime_dir();
+    if !sandbox_path_is_safe(&dir) {
+        return false;
+    }
+    clean_runtime_dir(&dir, full)
+}
+
+/// 清理指定 runtime 目录（`clean_sandbox_runtime` 的可测内核）。
+fn clean_runtime_dir(dir: &Path, full: bool) -> bool {
+    if !dir.exists() {
+        return false;
+    }
+    if full {
+        return std::fs::remove_dir_all(dir).is_ok();
+    }
+    let mut any = false;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            // Science 解压时用的临时名形如 `0.1.50-release.tmp-<pid>-<ts>`；
+            // 不写死版本号前缀，任何 `*.tmp-*` 都清掉。
+            if name.contains(".tmp-") {
+                let p = e.path();
+                let _ = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+/// 递归复制目录（用于把 runtime 从真实安装目录搬到沙箱）。
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let from = e.path();
+        let to = dst.join(e.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// 从**真实** Science 目录把 runtime 复制到沙箱，让 Science 跳过自己那次「解压 + 改名」。
+///
+/// 背景：Science 首次在沙箱 data-dir 展开 kernel runtime 时，先解到 `runtime/<ver>.tmp-<pid>-<ts>`
+/// 再改名到位。Windows 上这一步会因为杀毒软件 / 索引器占用而 `EPERM` 失败（客户真机复现），
+/// 而失败留下的半成品目录会让**之后每一次**启动都在同一步失败。
+/// 官方安装已经在真实目录里展开过同一份 runtime，复制过去即可绕过（我们本机验证：runtime 已在位时
+/// Science 不再重复展开）。
+///
+/// 铁律：真实目录**只读**，且只碰 `runtime/` 这一个子目录——`.oauth-tokens/`、`encryption.key`、
+/// `active-org.json`、`orgs/`、`.key-backups/` 等凭证一律不读不拷（铁律 1/2）。
+fn copy_runtime_from_real_install() -> Option<String> {
+    let real_runtime = dirs::home_dir()?.join(".claude-science").join("runtime");
+    if !real_runtime.is_dir() {
+        return None;
+    }
+    let ver_dir = std::fs::read_dir(&real_runtime)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().contains("-release"))
+                    .unwrap_or(false)
+        })?;
+    let name = ver_dir.file_name()?.to_os_string();
+    let dst = sandbox_runtime_dir().join(&name);
+    if dst.exists() {
+        return None; // 沙箱已有 → 不覆盖（Science 会自己判断是否需要展开）
+    }
+    if !sandbox_path_is_safe(&dst) {
+        return None;
+    }
+    copy_dir(&ver_dir, &dst).ok()?;
+    Some(dst.display().to_string())
+}
+
 #[derive(Default)]
 struct AppState {
     proxy: Option<Child>,
@@ -312,6 +435,22 @@ fn tail_file(path: &Path, max: usize) -> String {
     }
 }
 
+/// 只取文件里 `from` 之后新增的内容（本次启动新写的日志），末尾最多 `max` 字节。
+/// 用于判断「这次启动报了什么错」时不被上一次失败的旧日志误导。
+fn tail_file_from(path: &Path, from: usize, max: usize) -> String {
+    match std::fs::read(path) {
+        Ok(b) => {
+            let start = from.min(b.len());
+            let mut seg = &b[start..];
+            if seg.len() > max {
+                seg = &seg[seg.len() - max..];
+            }
+            String::from_utf8_lossy(seg).trim().to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
 fn kill_child(slot: &mut Option<Child>) {
     kill_owned(slot.take())
 }
@@ -408,10 +547,18 @@ enum ProxyAction {
 }
 
 /// 定位可起翻译代理的 Python 解释器。
+/// 顺序：① 用户在「高级设置」里手工指定的路径（最优先）→ ② 平台自动探测。
 /// Windows：`python3` 常是 WindowsApps 商店 stub（假命中：执行弹商店且无输出），且
 /// `fs::metadata` 不做 PATHEXT 解析（必须带 .exe 后缀才找得到），故候选带 .exe 变体并对每个
-/// 命中做 `--version` 验证，再退回 `python`。Unix 走 [`proc::find_exe`]（PATH+常见目录+登录 shell）。
+/// 命中做 `--version` 验证，再退回 `python`。Unix 走 [`proc::find_exe`]（PATH+常见目录+登录 shell）
+/// 并额外试 `python` 与 conda 常见目录（conda 环境未 activate 时 PATH 里没有 python3）。
 fn find_python() -> Option<PathBuf> {
+    // ① 用户指定路径：存在且 `--version` 验证通过就用它（不看是否在 PATH）。
+    if let Some(p) = configured_python() {
+        if python_works(&p) {
+            return Some(p);
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         for name in ["python3.exe", "python.exe", "python3", "python"] {
@@ -428,13 +575,72 @@ fn find_python() -> Option<PathBuf> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        proc::find_exe("python3")
+        for name in ["python3", "python"] {
+            if let Some(p) = proc::find_exe(name) {
+                if python_works(&p) {
+                    return Some(p);
+                }
+            }
+        }
+        // conda：环境常未 activate，PATH 里没有 python3，但解释器在 envs/<env>/bin 下。
+        for p in conda_pythons() {
+            if python_works(&p) {
+                return Some(p);
+            }
+        }
+        None
     }
+}
+
+/// 读配置里的自定义 Python 路径（`~/.csswitch/config.json` 的 `python_path`）。
+fn configured_python() -> Option<PathBuf> {
+    let dir = config::default_dir();
+    let cfg = config::load_from(&dir).ok()?;
+    let raw = cfg.python_path?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(&raw);
+    if p.is_absolute() && p.exists() {
+        return Some(p);
+    }
+    // 也允许填命令名（如 `python3.12`），走 PATH 解析。
+    proc::find_exe(&raw).or(Some(p))
+}
+
+/// Unix 常见 conda 布局下的 python 解释器（只读枚举，不执行任何东西）。
+#[cfg(not(target_os = "windows"))]
+fn conda_pythons() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(home) = dirs::home_dir() else { return out };
+    let mut roots = vec![home.join("anaconda3"), home.join("miniconda3"), home.join("miniforge3")];
+    if let Some(conda_envs) = std::env::var_os("CONDA_ENVS_PATH") {
+        for d in std::env::split_paths(&conda_envs) {
+            roots.push(d);
+        }
+    }
+    for root in roots {
+        // <root>/bin/python3 与 <root>/envs/*/bin/python3
+        for cand in [root.join("bin").join("python3")] {
+            if cand.is_file() {
+                out.push(cand);
+            }
+        }
+        let envs = root.join("envs");
+        if let Ok(rd) = std::fs::read_dir(&envs) {
+            for e in rd.flatten() {
+                let cand = e.path().join("bin").join("python3");
+                if cand.is_file() {
+                    out.push(cand);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 验证 Python 可执行（Windows 上 WindowsApps stub 会返回假命中）：`--version` 输出
 /// （stdout；stub 无输出则看 stderr）含 "Python" 才算可用（真实解释器形如 "Python 3.12.4"）。
-#[cfg(target_os = "windows")]
 fn python_works(p: &Path) -> bool {
     let out = match hidden(&mut Command::new(p))
         .arg("--version")
@@ -527,9 +733,17 @@ fn ensure_proxy(
         }
 
         // Python 解释器：懒定位（复用路径不付 PATH 扫描 + --version 验证的成本）。
-        let py = find_python().ok_or(
-            "缺少可用的 Python 解释器（起翻译代理需要）。已查 PATH（macOS 另查常见目录与登录 shell），Windows 上 python3/python 的 --version 均未验证通过。请安装 Python 3（python.org 或商店真实版）并确保其在 PATH 中。",
-        )?;
+        let py = find_python().ok_or_else(|| {
+            let hint = match configured_python() {
+                Some(p) => format!("已配置的路径 {} 不可用（不存在或不是真正的解释器）。", p.display()),
+                None => "未找到可用的 python3 / python。".to_string(),
+            };
+            format!(
+                "缺少可用的 Python 解释器（起翻译代理需要）。{hint}\n\
+                 请安装 Python 3 正式版（python.org；Windows 上不要用 Microsoft Store 版）并确保其在 PATH 中；\
+                 也可在「高级设置」里直接填写 python.exe 的完整路径。"
+            )
+        })?;
 
         let mut logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
@@ -751,6 +965,7 @@ fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> {
         "proxy_port": cfg.proxy_port,
         "sandbox_port": cfg.sandbox_port,
         "mode": cfg.mode,
+        "python_path": cfg.python_path.clone().unwrap_or_default(),
         "pending_notice": notice,
         "templates": build_list_templates(),
         "profiles": cfg.profiles.iter().map(|p| json!({
@@ -907,6 +1122,9 @@ fn open_official() -> Result<(), String> {
 struct UiSettings {
     proxy_port: u16,
     sandbox_port: u16,
+    /// 用户手工指定的 Python 解释器路径（空串=自动探测）。
+    #[serde(default)]
+    python_path: Option<String>,
 }
 
 #[tauri::command]
@@ -927,9 +1145,15 @@ fn set_config(cfg: UiSettings) -> Result<(), String> {
         return Err("代理端口与沙箱端口不能相同。".into());
     }
     let dir = config::default_dir();
+    let py_path = cfg
+        .python_path
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     config::update(&dir, move |c| {
         c.proxy_port = cfg.proxy_port;
         c.sandbox_port = cfg.sandbox_port;
+        c.python_path = py_path.clone();
     })
     .map(|_| ())
     .map_err(|e| e.to_string())
@@ -1307,6 +1531,139 @@ async fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> R
     sandbox_res.map_err(|e| format!("代理已停；但{e}真实实例 8765 未受影响。"))
 }
 
+/// Science 日志里出现这些片段 = 沙箱起不来（致命）。最常见的是 runtime 展开失败：
+/// Science 把自己的 kernel runtime 解到 `runtime/<ver>.tmp-<pid>-<ts>` 再改名到位，
+/// Windows 上这一步会被杀毒软件 / 索引器 / 权限挡住（客户真机 EPERM 复现）。
+fn fatal_sandbox_log(tail: &str) -> bool {
+    tail.contains("Couldn't unpack")
+        || tail.contains("console trampoline sync failed")
+        || tail.contains("EPERM")
+        || tail.contains("rename '")
+        || tail.contains("ENOTEMPTY")
+}
+
+/// 起沙箱 Science 并探活，失败时按「runtime 展开失败」自愈重试一次。
+///
+/// **冷启动可能要好几分钟**：Science 首次在沙箱 data-dir 里展开自己的 kernel runtime
+/// （Windows 约 124 MB）并起内核，端口才监听。原实现只等 20s 就判超时，客户真机上直接把
+/// 还在解压的 daemon 杀掉 → 留下半成品 runtime → 之后每次启动都在「改名到位」那步 EPERM 失败
+/// （自伤循环）。现在：给足 180s、daemon 死了立刻报错、命中解压类错误就清残留 +
+/// 复制官方 runtime 并重试一次。
+#[cfg(target_os = "windows")]
+fn spawn_sandbox_and_probe(
+    app: &tauri::AppHandle,
+    state: &State<'_, Mutex<AppState>>,
+    bin: &Path,
+    auth_dir: &Path,
+    sport: u16,
+    proxy_url: &str,
+    sbx_home: &Path,
+    secret: &str,
+    logf: &std::fs::File,
+) -> Result<(), String> {
+    let mut attempt = 0u8;
+    loop {
+        attempt += 1;
+        // 只看本次启动新产生的日志（上次失败留下的旧尾巴不能用来判断这次）。
+        let log_start = std::fs::metadata(log_path("sandbox.log"))
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let mut cmd = Command::new(bin);
+        hidden(&mut cmd);
+        cmd.arg("serve")
+            .arg("--data-dir")
+            .arg(auth_dir)
+            // auth_dir 必须在 config 里指回沙箱，否则 Science 去真实目录读登录态（铁律 1/2）。
+            .arg("--config")
+            .arg(write_science_config(auth_dir)?)
+            .arg("--port")
+            .arg(sport.to_string())
+            .arg("--no-browser")
+            .arg("--no-auto-update")
+            .arg("--detached")
+            .env("ANTHROPIC_BASE_URL", proxy_url)
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("NO_PROXY", "127.0.0.1,localhost");
+        science_cli_env(&mut cmd, sbx_home);
+        let child = cmd
+            .stdout(Stdio::from(logf.try_clone().map_err(|e| e.to_string())?))
+            .stderr(Stdio::from(logf.try_clone().map_err(|e| e.to_string())?))
+            .spawn()
+            .map_err(|e| format!("起沙箱失败：{e}"))?;
+        {
+            let mut st = lock(state);
+            st.sandbox = Some(child);
+            st.sandbox_port = sport;
+        }
+
+        // 轮询沙箱 /health 直到就绪或超时（冷启动含 runtime 展开，给 180s）。
+        //
+        // **不用「父进程退出」判失败**：`serve --detached` 的启动器进程在 daemon 就绪后
+        // **自己就会退出**（真正的 daemon 是它派生的 `--_daemon-child`），照退出判定会把
+        // 健康的 daemon 误杀。改为看日志里有没有致命错误（runtime 展开失败等）——那才是
+        // 真正起不来的信号。
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        let mut ok = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            if proc::http_health(sport, None, 400) {
+                ok = true;
+                break;
+            }
+            // 日志出现致命错误（runtime 展开失败 / 权限不足）→ 立刻中止等待。
+            let tail = tail_file_from(&log_path("sandbox.log"), log_start, 4000);
+            if fatal_sandbox_log(&tail) {
+                break;
+            }
+        }
+        if ok {
+            return Ok(());
+        }
+
+        let new_tail = redact(
+            &tail_file_from(&log_path("sandbox.log"), log_start, 2500),
+            secret,
+        );
+        let unpack_failed = fatal_sandbox_log(&new_tail);
+        // 探活失败：停掉刚起的沙箱（不留下孤儿进程），并清掉它可能留下的 runtime 临时目录
+        // ——留着它会让下一次启动在同一步失败。
+        {
+            let mut st = lock(state);
+            let _ = stop_sandbox_inner(app, &mut st); // best-effort 清理
+        }
+        clean_sandbox_runtime(false);
+
+        if attempt == 1 && unpack_failed {
+            // 自愈：半成品 runtime 目录会让 Science 下次「改名到位」必失败（EPERM/ENOTEMPTY）。
+            // 清掉它，再把**真实安装目录**里已展开好的同一份 runtime 复制进沙箱，
+            // 让 Science 跳过自己那次解压（真实目录只读，且只碰 runtime/ 子目录）。
+            let cleaned = clean_sandbox_runtime(true);
+            let copied = copy_runtime_from_real_install();
+            let detail = match copied {
+                Some(p) => {
+                    format!("已清理半成品 runtime 并复制官方 runtime（{p}），正在重试启动。")
+                }
+                None if cleaned => "已清理半成品 runtime，正在重试启动。".to_string(),
+                None => "正在清理 runtime 残留并重试启动。".to_string(),
+            };
+            let _ = detail;
+            continue;
+        }
+
+        if unpack_failed {
+            return Err(format!(
+                "沙箱启动失败（端口 {sport}）。Science 展开自己的运行时文件时被系统拒绝（通常是\
+                 杀毒软件/索引器正在占用，或目录权限不足）；请关闭杀毒软件实时防护后重试，\
+                 或用管理员身份运行一次让文件落地。日志：\n{new_tail}"
+            ));
+        }
+        return Err(format!(
+            "沙箱起后探活超时（端口 {sport}，已等 180 秒）。首次启动需展开 runtime（约 124 MB），\
+             请确认磁盘有空间、杀毒软件未拦截；日志：\n{new_tail}"
+        ));
+    }
+}
+
 /// 「一键开始」：起代理 → 写虚拟 OAuth → 起沙箱 Science → 探活 → 开浏览器。
 /// macOS：经 launch/stop 脚本；Windows：原生 `claude-science serve --detached`（独立
 /// data-dir + HOME/USERPROFILE，铁律 3）。其他平台应使用远程模式 (`remote_*` 命令)。
@@ -1544,55 +1901,18 @@ async fn one_click_login(
             forged.enc_file.display()
         );
     }
-    let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-    let mut cmd = Command::new(&bin);
-    hidden(&mut cmd);
-    cmd.arg("serve")
-        .arg("--data-dir")
-        .arg(&auth_dir)
-        // auth_dir 必须在 config 里指回沙箱，否则 Science 去真实目录读登录态（铁律 1/2）。
-        .arg("--config")
-        .arg(write_science_config(&auth_dir)?)
-        .arg("--port")
-        .arg(sport.to_string())
-        .arg("--no-browser")
-        .arg("--no-auto-update")
-        .arg("--detached")
-        .env("ANTHROPIC_BASE_URL", &proxy_url)
-        .env("no_proxy", "127.0.0.1,localhost")
-        .env("NO_PROXY", "127.0.0.1,localhost");
-    science_cli_env(&mut cmd, &sbx_home);
-    let child = cmd
-        .stdout(Stdio::from(logf))
-        .stderr(Stdio::from(logf2))
-        .spawn()
-        .map_err(|e| format!("起沙箱失败：{e}"))?;
-    {
-        let mut st = lock(&state);
-        st.sandbox = Some(child);
-        st.sandbox_port = sport;
-    }
-
-    // 5. 轮询沙箱 /health 直到就绪或超时（Windows daemon 启动较慢，~20s）。
-    let mut ok = false;
-    for _ in 0..200 {
-        std::thread::sleep(Duration::from_millis(100));
-        if proc::http_health(sport, None, 400) {
-            ok = true;
-            break;
-        }
-    }
-    if !ok {
-        let tail = redact(&tail_file(&log_path("sandbox.log"), 600), &secret);
-        // 探活超时：必须停掉刚起的沙箱，否则留孤儿沙箱进程（修 P2-2）。
-        {
-            let mut st = lock(&state);
-            let _ = stop_sandbox_inner(&app, &mut st); // best-effort 清理
-        }
-        return Err(format!(
-            "沙箱起后探活超时（端口 {sport}）。已尝试停掉刚起的沙箱。\n{tail}"
-        ));
-    }
+    // 4b. 起沙箱 + 探活（含 runtime 展开失败自愈）。
+    spawn_sandbox_and_probe(
+        &app,
+        &state,
+        &bin,
+        &auth_dir,
+        sport,
+        &proxy_url,
+        &sbx_home,
+        &secret,
+        &logf,
+    )?;
 
     // 5b. 身份确认（修 P2 GPT 复审）：/health 200 只证明端口在服务，不证明是我们的 Science。
     // 按 data-dir 强身份再确认一次；不是我们的 → 当启动失败处理，停掉并如实报错。
@@ -2116,5 +2436,63 @@ mod tests {
             s.ends_with(".com") || s.ends_with(".exe"),
             "应是 .com shim 或 .exe：{bin:?}"
         );
+    }
+
+    /// tail_file_from 只取本次启动新增的日志，不被上次的旧尾巴误导（自愈判断依赖这个）。
+    #[test]
+    fn tail_file_from_only_returns_new_bytes() {
+        let dir = std::env::temp_dir().join("csswitch-test-tailfrom");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("t.log");
+        std::fs::write(&p, b"OLD-ERROR-EPERM\n").unwrap();
+        let from = std::fs::metadata(&p).unwrap().len() as usize;
+        std::fs::write(&p, b"OLD-ERROR-EPERM\nNEW-GOOD-LINE\n").unwrap();
+        let got = super::tail_file_from(&p, from, 2500);
+        assert!(!got.contains("OLD-ERROR"), "旧内容不应出现：{got:?}");
+        assert!(got.contains("NEW-GOOD-LINE"), "新内容应出现：{got:?}");
+        // from 超过文件长度时也不应 panic。
+        let _ = super::tail_file_from(&p, 999_999, 2500);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// sandbox_path_is_safe：只接受沙箱目录下的路径，越界（真实目录）一律拒绝。
+    #[test]
+    fn sandbox_path_is_safe_rejects_outside_paths() {
+        assert!(
+            !super::sandbox_path_is_safe(&super::sandbox_home().join("..").join("..")),
+            "越界路径必须被拒绝"
+        );
+        let inside = super::sandbox_home()
+            .join(".claude-science")
+            .join("runtime");
+        // 该路径目前可能还不存在；不存在不是符号链接，逐级检查应通过。
+        assert!(
+            super::sandbox_path_is_safe(&inside),
+            "沙箱内的 runtime 路径应被接受：{inside:?}"
+        );
+    }
+
+    /// clean_runtime_dir：只删 `.tmp-*` 残留时，正式目录必须保留；full=true 时全删。
+    #[test]
+    fn clean_runtime_dir_only_removes_tmp_when_not_full() {
+        let dir = std::env::temp_dir().join("csswitch-test-runtime-clean");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("0.1.50-release")).unwrap();
+        std::fs::create_dir_all(dir.join("0.1.50-release.tmp-123-456")).unwrap();
+        std::fs::write(dir.join("0.1.50-release").join("keep.txt"), b"x").unwrap();
+
+        assert!(super::clean_runtime_dir(&dir, false), "应报告清理过东西");
+        assert!(
+            dir.join("0.1.50-release").join("keep.txt").is_file(),
+            "正式目录必须保留"
+        );
+        assert!(
+            !dir.join("0.1.50-release.tmp-123-456").exists(),
+            ".tmp- 临时目录应被清掉"
+        );
+
+        assert!(super::clean_runtime_dir(&dir, true), "full 应报告成功");
+        assert!(!dir.exists(), "full=true 应删掉整个 runtime 目录");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

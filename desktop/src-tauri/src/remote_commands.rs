@@ -457,6 +457,7 @@ fn remote_active_config_for_start(
         secret: secret.to_string(),
         mode: cfg.mode,
         pending_notice: None,
+        python_path: cfg.python_path.clone(),
     };
     Ok((remote_cfg, adapter))
 }

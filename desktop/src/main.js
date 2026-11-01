@@ -36,6 +36,7 @@ function mockInvoke(cmd, args) {
         active_id: mockStore.active_id,
         proxy_port: mockStore.proxy_port,
         sandbox_port: mockStore.sandbox_port,
+        python_path: mockStore.python_path || "",
         mode: mockStore.mode,
         templates: MOCK_TEMPLATES,
         profiles: mockStore.profiles.map((p) => ({ ...p })),
@@ -46,6 +47,7 @@ function mockInvoke(cmd, args) {
     case "set_config":
       mockStore.proxy_port = args.cfg.proxy_port;
       mockStore.sandbox_port = args.cfg.sandbox_port;
+      mockStore.python_path = args.cfg.python_path || "";
       return Promise.resolve(null);
     case "set_mode":
       mockStore.mode = args.mode;
@@ -187,6 +189,7 @@ let state = {
   active_id: "",
   proxy_port: 18991,
   sandbox_port: 8990,
+  python_path: "",
 };
 
 const CAT_LABELS = { official: "官方", cn_official: "国内", custom: "自定义" };
@@ -305,6 +308,8 @@ async function loadConfig() {
     state.sandbox_port = cfg.sandbox_port ?? 8990;
     els.proxyPort.value = state.proxy_port;
     els.sandboxPort.value = state.sandbox_port;
+    state.python_path = cfg.python_path || "";
+    els.pythonPath.value = state.python_path;
     applyMode(cfg.mode === "official" ? "official" : "proxy");
     renderList();
     showView("list");
@@ -381,6 +386,7 @@ async function persistPorts() {
   const cfg = {
     proxy_port: parseInt(els.proxyPort.value, 10) || 18991,
     sandbox_port: parseInt(els.sandboxPort.value, 10) || 8990,
+    python_path: (els.pythonPath.value || "").trim(),
   };
   try {
     try {
@@ -390,7 +396,8 @@ async function persistPorts() {
     }
     state.proxy_port = cfg.proxy_port;
     state.sandbox_port = cfg.sandbox_port;
-    setMsg("端口设置已保存。", "ok");
+    state.python_path = cfg.python_path;
+    setMsg("设置已保存。", "ok");
   } catch (e) {
     setMsg("保存端口失败：" + e, "err");
   }
@@ -1313,7 +1320,7 @@ function wire() {
   [
     "oneClickBtn", "stopBtn", "ltProxy", "ltSandbox", "ltUpstream", "msg", "brandDot",
     "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel", "reportBtn", "logsBtn", "quitBtn",
-    "modeSeg", "targetSeg", "proxyPort", "sandboxPort", "advSec", "listSec", "profileList",
+    "modeSeg", "targetSeg", "proxyPort", "sandboxPort", "pythonPath", "advSec", "listSec", "profileList",
     "newBtn", "skipActivateBtn", "wizSec", "wizTemplate", "wizTemplateChips", "wizTplHint",
     "wizName", "wizBase", "wizBaseHint", "wizFetchBtn", "wizModelInfo", "wizModel",
     "wizModelList", "wizModelHint", "wizKey", "wizSaveBtn", "wizCancelBtn", "connSec",
@@ -1336,6 +1343,7 @@ function wire() {
   els.targetSeg.querySelectorAll(".seg-btn").forEach((b) => b.addEventListener("click", () => switchTarget(b.dataset.target)));
   els.proxyPort.addEventListener("change", persistPorts);
   els.sandboxPort.addEventListener("change", persistPorts);
+  els.pythonPath.addEventListener("change", persistPorts);
   els.newBtn.addEventListener("click", openWizard);
   els.skipActivateBtn.addEventListener("click", () => pendingSkipActivateId && activateProfile(pendingSkipActivateId, true));
 
